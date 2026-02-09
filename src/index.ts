@@ -369,6 +369,55 @@ async function getTitlesMultiPage(params: {
   return { items: allItems, pageCount: totalPageCount };
 }
 
+// Load ALL pages at once
+async function getAllTitles(params: {
+  search: string;
+  sortBy: string;
+  sortOrder: string;
+}): Promise<{ items: TitleCard[]; pageCount: number }> {
+  // First, get page 1 to find total page count
+  const firstPage = await getTitlesPage({
+    page: 1,
+    search: params.search,
+    sortBy: params.sortBy,
+    sortOrder: params.sortOrder,
+  });
+
+  const totalPages = firstPage.pageCount ?? 1;
+  if (totalPages === 1) {
+    return { items: firstPage.items, pageCount: 1 };
+  }
+
+  // Fetch remaining pages in parallel batches
+  const allItems = [...firstPage.items];
+  const BATCH = 5; // Fetch 5 pages at a time to not overwhelm the server
+
+  for (let startPage = 2; startPage <= totalPages; startPage += BATCH) {
+    const endPage = Math.min(startPage + BATCH - 1, totalPages);
+    const pagePromises = [];
+
+    for (let p = startPage; p <= endPage; p++) {
+      pagePromises.push(
+        getTitlesPage({
+          page: p,
+          search: params.search,
+          sortBy: params.sortBy,
+          sortOrder: params.sortOrder,
+        }).catch(() => null),
+      );
+    }
+
+    const results = await Promise.all(pagePromises);
+    for (const result of results) {
+      if (result) {
+        allItems.push(...result.items);
+      }
+    }
+  }
+
+  return { items: allItems, pageCount: totalPages };
+}
+
 function getLanAddresses() {
   const interfaces = os.networkInterfaces();
   const addresses: string[] = [];
@@ -513,7 +562,11 @@ const server = Bun.serve({
         if (response.status === 302 || response.status === 301) {
           const location = response.headers.get("Location");
           if (location) {
-            log("INFO", `Resolved download`, { id, type, redirect: location.substring(0, 80) + "..." });
+            log("INFO", `Resolved download`, {
+              id,
+              type,
+              redirect: location.substring(0, 80) + "...",
+            });
             return new Response(null, {
               status: 302,
               headers: { Location: location },
@@ -521,10 +574,18 @@ const server = Bun.serve({
           }
         }
 
-        log("ERROR", `Download resolution failed`, { id, type, status: response.status });
+        log("ERROR", `Download resolution failed`, {
+          id,
+          type,
+          status: response.status,
+        });
         return jsonResponse({ error: "Download not found" }, 404);
       } catch (error) {
-        log("ERROR", `Download proxy error`, { id, type, error: error instanceof Error ? error.message : String(error) });
+        log("ERROR", `Download proxy error`, {
+          id,
+          type,
+          error: error instanceof Error ? error.message : String(error),
+        });
         return jsonResponse({ error: "Failed to resolve download" }, 502);
       }
     }
@@ -653,15 +714,21 @@ const server = Bun.serve({
         const typeFilter = url.searchParams.get("type") ?? ""; // "games", "dlc", or ""
         const includeAll = url.searchParams.get("all") === "true"; // Include updates, DLC, full
         const multiPage = url.searchParams.get("multi") === "true"; // Load multiple pages at once
+        const loadAll = url.searchParams.get("loadall") === "true"; // Load ALL pages at once
 
         // Get base URL from request for building directory links
         const host = request.headers.get("host") ?? `localhost:${PORT}`;
         const protocol = request.headers.get("x-forwarded-proto") ?? "http";
         const baseUrl = `${protocol}://${host}`;
 
-        // Fetch titles (single page or multi-page)
+        // Fetch titles based on mode
         let result: { items: TitleCard[]; pageCount: number | null };
-        if (multiPage) {
+        if (loadAll) {
+          // Load ALL pages at once
+          log("INFO", "Loading all pages...");
+          result = await getAllTitles({ search, sortBy, sortOrder });
+          log("INFO", `Loaded ${result.items.length} total items from ${result.pageCount} pages`);
+        } else if (multiPage) {
           result = await getTitlesMultiPage({
             startPage: page,
             pageCount: MULTI_PAGE_COUNT,
@@ -843,46 +910,43 @@ const server = Bun.serve({
         // Build directories for pagination and category navigation
         const directories: (string | { url: string; title: string })[] = [];
 
-        // Add menu options on first page when not filtered
-        if (page === 1 && !typeFilter && !search) {
-          // Category filters
+        // Add menu options on first page when not filtered (or when loadall)
+        if ((page === 1 || loadAll) && !typeFilter && !search) {
+          // Main browse options
           directories.push(
             {
-              url: `${baseUrl}/tinfoil.json?type=games&all=true`,
-              title: "[Games + Updates + DLC]",
+              url: `${baseUrl}/tinfoil.json?loadall=true`,
+              title: "[ ALL GAMES ]",
             },
             {
-              url: `${baseUrl}/tinfoil.json?type=games`,
-              title: "[Games Only]",
-            },
-            { url: `${baseUrl}/tinfoil.json?type=dlc`, title: "[DLC Only]" },
-          );
-
-          // Sort options
-          directories.push(
-            {
-              url: `${baseUrl}/tinfoil.json?sb=name&so=asc`,
-              title: "[Sort: A-Z]",
+              url: `${baseUrl}/tinfoil.json?loadall=true&type=games&all=true`,
+              title: "[ All Games + Updates + DLC ]",
             },
             {
-              url: `${baseUrl}/tinfoil.json?sb=name&so=desc`,
-              title: "[Sort: Z-A]",
-            },
-            {
-              url: `${baseUrl}/tinfoil.json?sb=size&so=desc`,
-              title: "[Sort: Size]",
+              url: `${baseUrl}/tinfoil.json?loadall=true&type=dlc`,
+              title: "[ All DLC Only ]",
             },
           );
 
-          // Multi-page loading
-          directories.push({
-            url: `${baseUrl}/tinfoil.json?multi=true`,
-            title: "[Fast Load (3 pages)]",
-          });
+          // Sort options (with loadall)
+          directories.push(
+            {
+              url: `${baseUrl}/tinfoil.json?loadall=true&sb=name&so=asc`,
+              title: "[ A-Z ]",
+            },
+            {
+              url: `${baseUrl}/tinfoil.json?loadall=true&sb=name&so=desc`,
+              title: "[ Z-A ]",
+            },
+            {
+              url: `${baseUrl}/tinfoil.json?loadall=true&sb=size&so=desc`,
+              title: "[ By Size ]",
+            },
+          );
         }
 
-        // Add pagination (next page)
-        if (page < pageCount) {
+        // Add pagination (next page) - only when not loading all
+        if (!loadAll && page < pageCount) {
           const nextParams = new URLSearchParams();
           const nextPage = multiPage ? page + MULTI_PAGE_COUNT : page + 1;
           nextParams.set("p", String(nextPage));
@@ -892,7 +956,10 @@ const server = Bun.serve({
           if (typeFilter) nextParams.set("type", typeFilter);
           if (includeAll) nextParams.set("all", "true");
           if (multiPage) nextParams.set("multi", "true");
-          directories.push(`${baseUrl}/tinfoil.json?${nextParams.toString()}`);
+          directories.push({
+            url: `${baseUrl}/tinfoil.json?${nextParams.toString()}`,
+            title: `[ Page ${nextPage} >> ]`,
+          });
         }
 
         return jsonResponse({
