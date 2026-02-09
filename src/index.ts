@@ -117,6 +117,9 @@ function buildListUrl(params: {
   return url.toString();
 }
 
+// Fetch timeout in milliseconds
+const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS ?? "15000", 10);
+
 async function fetchHtml(url: string) {
   const cached = cache.get(url);
   const now = Date.now();
@@ -126,22 +129,36 @@ async function fetchHtml(url: string) {
   }
   stats.cacheMisses++;
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
-  if (!response.ok) {
-    throw new Error(
-      `Upstream request failed: ${response.status} ${response.statusText}`,
-    );
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(
+        `Upstream request failed: ${response.status} ${response.statusText}`,
+      );
+    }
+
+    const html = await response.text();
+    cache.set(url, { data: html, expiresAt: now + CACHE_TTL_MS });
+    return html;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Request timeout after ${FETCH_TIMEOUT_MS}ms: ${url}`);
+    }
+    throw error;
   }
-
-  const html = await response.text();
-  cache.set(url, { data: html, expiresAt: now + CACHE_TTL_MS });
-  return html;
 }
 
 // Resolve download URL using auth token - follows redirects to get final Yandex.Disk URL
@@ -154,6 +171,9 @@ async function resolveDownloadUrl(
   const now = Date.now();
   if (cached && cached.expiresAt > now) return cached.data;
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
   try {
     const apiUrl = `${API_URL}/games/download/${titleId}/${type}`;
     const response = await fetch(apiUrl, {
@@ -162,7 +182,10 @@ async function resolveDownloadUrl(
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
       },
       redirect: "manual",
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (response.status === 302 || response.status === 301) {
       const location = response.headers.get("Location");
@@ -174,6 +197,7 @@ async function resolveDownloadUrl(
     }
     return null;
   } catch {
+    clearTimeout(timeoutId);
     return null;
   }
 }
@@ -548,6 +572,9 @@ const server = Bun.serve({
 
       if (!id) return jsonResponse({ error: "Missing game id" }, 400);
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
       try {
         const apiUrl = `${API_URL}/games/download/${id}/${type}`;
         const response = await fetch(apiUrl, {
@@ -557,7 +584,10 @@ const server = Bun.serve({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
           },
           redirect: "manual",
+          signal: controller.signal,
         });
+
+        clearTimeout(timeoutId);
 
         if (response.status === 302 || response.status === 301) {
           const location = response.headers.get("Location");
@@ -581,12 +611,18 @@ const server = Bun.serve({
         });
         return jsonResponse({ error: "Download not found" }, 404);
       } catch (error) {
+        clearTimeout(timeoutId);
+        const errMsg = error instanceof Error ? error.message : String(error);
+        const isTimeout = error instanceof Error && error.name === "AbortError";
         log("ERROR", `Download proxy error`, {
           id,
           type,
-          error: error instanceof Error ? error.message : String(error),
+          error: isTimeout ? "Request timeout" : errMsg,
         });
-        return jsonResponse({ error: "Failed to resolve download" }, 502);
+        return jsonResponse(
+          { error: isTimeout ? "Download request timed out" : "Failed to resolve download" },
+          isTimeout ? 504 : 502
+        );
       }
     }
 
@@ -727,7 +763,10 @@ const server = Bun.serve({
           // Load ALL pages at once
           log("INFO", "Loading all pages...");
           result = await getAllTitles({ search, sortBy, sortOrder });
-          log("INFO", `Loaded ${result.items.length} total items from ${result.pageCount} pages`);
+          log(
+            "INFO",
+            `Loaded ${result.items.length} total items from ${result.pageCount} pages`,
+          );
         } else if (multiPage) {
           result = await getTitlesMultiPage({
             startPage: page,
