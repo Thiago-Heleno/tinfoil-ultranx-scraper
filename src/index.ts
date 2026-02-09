@@ -495,8 +495,52 @@ const server = Bun.serve({
           "GET /api/titles - List all titles",
           "GET /api/game/:id - Get game details",
           "GET /shop - HTML browser",
+          "GET /test - Test upstream connectivity",
         ],
       });
+    }
+
+    // Test upstream connectivity
+    if (pathname === "/test") {
+      const testStart = Date.now();
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+        const response = await fetch("https://not.ultranx.ru/en", {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          },
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+        const elapsed = Date.now() - testStart;
+
+        return jsonResponse({
+          ok: response.ok,
+          status: response.status,
+          elapsed: `${elapsed}ms`,
+          message: response.ok
+            ? "Upstream reachable"
+            : "Upstream returned error",
+        });
+      } catch (error) {
+        const elapsed = Date.now() - testStart;
+        const isTimeout = error instanceof Error && error.name === "AbortError";
+        return jsonResponse(
+          {
+            ok: false,
+            elapsed: `${elapsed}ms`,
+            error: isTimeout
+              ? "Timeout after 10s"
+              : error instanceof Error
+                ? error.message
+                : String(error),
+          },
+          502,
+        );
+      }
     }
 
     if (pathname === "/api/titles") {
@@ -620,8 +664,12 @@ const server = Bun.serve({
           error: isTimeout ? "Request timeout" : errMsg,
         });
         return jsonResponse(
-          { error: isTimeout ? "Download request timed out" : "Failed to resolve download" },
-          isTimeout ? 504 : 502
+          {
+            error: isTimeout
+              ? "Download request timed out"
+              : "Failed to resolve download",
+          },
+          isTimeout ? 504 : 502,
         );
       }
     }
