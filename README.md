@@ -1,6 +1,6 @@
 # tinfoil-ultranx-scraper
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/from?repoUrl=https%3A%2F%2Fgithub.com%2FThiago-Heleno%2Ftinfoil-ultranx-scraper)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template?template=https%3A%2F%2Fgithub.com%2FThiago-Heleno%2Ftinfoil-ultranx-scraper)
 
 Bun server that scrapes titles from not.ultranx.ru and exposes JSON plus a Tinfoil-friendly index.
 
