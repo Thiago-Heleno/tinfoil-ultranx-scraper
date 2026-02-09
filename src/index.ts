@@ -13,7 +13,7 @@ const MAX_PAGES = parseInt(process.env.MAX_PAGES ?? "10", 10);
 const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "5", 10);
 const MULTI_PAGE_COUNT = parseInt(process.env.MULTI_PAGE_COUNT ?? "3", 10);
 const LOG_REQUESTS = process.env.LOG_REQUESTS !== "false";
-const REFERRER = process.env.REFERRER ?? "";
+const REFERRER = process.env.REFERRER || "https://not.ultranx.ru";
 const TINFOIL_MIN_VERSION = 17.0;
 
 // Auth token for direct API downloads
@@ -857,7 +857,7 @@ const server = Bun.serve({
         return jsonResponse({
           // Tinfoil configuration
           version: TINFOIL_MIN_VERSION,
-          ...(REFERRER && { referrer: REFERRER }),
+          referrer: REFERRER,
 
           // Auth cookie header for API requests
           headers: [`Cookie: auth_token=${AUTH_TOKEN}`],
