@@ -1,17 +1,17 @@
 # tinfoil-ultranx-scraper
 
-[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/Thiago-Heleno/tinfoil-ultranx-scraper&envs=AUTH_TOKEN&AUTH_TOKENDesc=JWT%20token%20from%20not.ultranx.ru)
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/from?repoUrl=https%3A%2F%2Fgithub.com%2FThiago-Heleno%2Ftinfoil-ultranx-scraper)
 
 Bun server that scrapes titles from not.ultranx.ru and exposes JSON plus a Tinfoil-friendly index.
 
 ## Deploy to Railway
 
-1. Push this repo to your GitHub
-2. Update the deploy button URL in this README with your GitHub username
-3. Click the "Deploy on Railway" button
-4. Set the `AUTH_TOKEN` environment variable (your JWT from not.ultranx.ru)
-5. Deploy and get your public URL
-6. Add to Tinfoil: `https://YOUR-APP.up.railway.app/tinfoil.json`
+1. Click the "Deploy on Railway" button above
+2. Connect your GitHub account if prompted
+3. After deployment, go to **Variables** tab and add:
+   - `AUTH_TOKEN` = Your JWT token from not.ultranx.ru
+4. Redeploy to apply the variable
+5. Add to Tinfoil: `https://YOUR-APP.up.railway.app/tinfoil.json`
 
 ## Requirements
 
