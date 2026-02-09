@@ -854,29 +854,10 @@ const server = Bun.serve({
           directories.push(`${baseUrl}/tinfoil.json?${nextParams.toString()}`);
         }
 
-        // Determine category label for success message
-        const sortLabel =
-          sortBy !== "release_date" ? ` (${sortBy} ${sortOrder})` : "";
-        const categoryLabel =
-          typeFilter === "games"
-            ? includeAll
-              ? "Games + Updates + DLC"
-              : "Games Only"
-            : typeFilter === "dlc"
-              ? "DLC Only"
-              : "All Titles";
-
-        const pagesLoaded = multiPage
-          ? `${page}-${Math.min(page + MULTI_PAGE_COUNT - 1, pageCount)}`
-          : String(page);
-
         return jsonResponse({
           // Tinfoil configuration
           version: TINFOIL_MIN_VERSION,
           ...(REFERRER && { referrer: REFERRER }),
-
-          // Status message
-          success: `${categoryLabel}${sortLabel} - Page ${pagesLoaded} of ${pageCount} (${files.length} files)${includeAll ? " [Deep]" : ""}${multiPage ? " [Fast]" : ""}`,
 
           // Auth cookie header for API requests
           headers: [`Cookie: auth_token=${AUTH_TOKEN}`],
