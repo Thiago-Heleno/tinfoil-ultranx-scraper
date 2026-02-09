@@ -418,6 +418,7 @@ const server = Bun.serve({
         },
         endpoints: [
           "GET /tinfoil.json - Tinfoil shop index",
+          "GET /download/:id/:type - Download proxy (resolves to Yandex)",
           "GET /api/titles - List all titles",
           "GET /api/game/:id - Get game details",
           "GET /shop - HTML browser",
@@ -486,6 +487,45 @@ const server = Bun.serve({
           },
           502,
         );
+      }
+    }
+
+    // Download proxy - resolves API redirect to Yandex URL server-side
+    // This prevents Tinfoil from sending referer to Yandex which blocks it
+    if (pathname.startsWith("/download/")) {
+      const parts = pathname.replace("/download/", "").split("/");
+      const id = parts[0];
+      const type = parts[1] || "base";
+
+      if (!id) return jsonResponse({ error: "Missing game id" }, 400);
+
+      try {
+        const apiUrl = `${API_URL}/games/download/${id}/${type}`;
+        const response = await fetch(apiUrl, {
+          headers: {
+            Cookie: `auth_token=${AUTH_TOKEN}`,
+            Referer: REFERRER,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+          },
+          redirect: "manual",
+        });
+
+        if (response.status === 302 || response.status === 301) {
+          const location = response.headers.get("Location");
+          if (location) {
+            log("INFO", `Resolved download`, { id, type, redirect: location.substring(0, 80) + "..." });
+            return new Response(null, {
+              status: 302,
+              headers: { Location: location },
+            });
+          }
+        }
+
+        log("ERROR", `Download resolution failed`, { id, type, status: response.status });
+        return jsonResponse({ error: "Download not found" }, 404);
+      } catch (error) {
+        log("ERROR", `Download proxy error`, { id, type, error: error instanceof Error ? error.message : String(error) });
+        return jsonResponse({ error: "Failed to resolve download" }, 502);
       }
     }
 
@@ -793,7 +833,8 @@ const server = Bun.serve({
             }
 
             files.push({
-              url: `${dl.apiUrl}#${encodeURIComponent(filename)}`,
+              // Use proxy endpoint to avoid Yandex referer blocking
+              url: `${baseUrl}/download/${item.id}/${dl.type}#${encodeURIComponent(filename)}`,
               size: size || parseSizeToBytes(item.size),
             });
           }
@@ -857,10 +898,7 @@ const server = Bun.serve({
         return jsonResponse({
           // Tinfoil configuration
           version: TINFOIL_MIN_VERSION,
-          referrer: REFERRER,
-
-          // Auth cookie header for API requests
-          headers: [`Cookie: auth_token=${AUTH_TOKEN}`],
+          // No referrer or headers needed - proxy handles auth internally
 
           // Game data
           titledb,
