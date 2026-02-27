@@ -83,6 +83,15 @@ function queryBool(v: string | null): boolean {
   return v === "true" || v === "1" || v.toLowerCase() === "yes";
 }
 
+function querySearch(params: URLSearchParams): string {
+  const aliases = ["s", "q", "query", "search", "term"];
+  for (const key of aliases) {
+    const value = params.get(key);
+    if (value && value.trim()) return value.trim();
+  }
+  return "";
+}
+
 function sortBy(v: string | null): "release_date" | "name" | "size" {
   return SORT_BY.has(v ?? "") ? (v as "release_date" | "name" | "size") : "release_date";
 }
@@ -382,7 +391,7 @@ const server = Bun.serve({
       if (path === "/api/titles") {
         const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
         const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
-        const s = (url.searchParams.get("s") ?? "").trim();
+        const s = querySearch(url.searchParams);
         const sb = sortBy(url.searchParams.get("sb"));
         const so = sortOrder(url.searchParams.get("so"));
         const data = await getTitlesRange(p, pages, s, sb, so);
@@ -411,7 +420,7 @@ const server = Bun.serve({
 
       if (path === "/shop") {
         const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
-        const s = (url.searchParams.get("s") ?? "").trim();
+        const s = querySearch(url.searchParams);
         const sb = sortBy(url.searchParams.get("sb"));
         const so = sortOrder(url.searchParams.get("so"));
         const data = await getTitlesRange(p, 1, s, sb, so);
@@ -437,7 +446,7 @@ const server = Bun.serve({
       if (path === "/tinfoil.json") {
         const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
         const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
-        const s = (url.searchParams.get("s") ?? "").trim();
+        const s = querySearch(url.searchParams);
         const sb = sortBy(url.searchParams.get("sb"));
         const so = sortOrder(url.searchParams.get("so"));
         const loadAll = queryBool(url.searchParams.get("loadall"));
