@@ -37,17 +37,23 @@ bun run start
 
 - `GET /api/titles?p=1&pages=1&s=&sb=release_date&so=desc`
 - `GET /api/game/:id`
+- `GET /download/:id/:type` (`type` = `base|update|dlc|full`)
 - `GET /shop?p=1` (also works with trailing slash)
 - `GET /tinfoil.json`
+- `GET /health`
 
 ## Environment
 
 - `PORT` (default: 3000)
 - `CACHE_TTL_MS` (default: 300000)
 - `MAX_PAGES` (default: 10)
-- `SHOP_MAX_PAGES` (default: 10)
+- `BATCH_SIZE` (default: 5)
+- `FETCH_TIMEOUT_MS` (default: 15000)
+- `TINFOIL_MIN_VERSION` (default: 17)
+- `AUTH_TOKEN` (required for `/download/*` and actual installs in Tinfoil)
 
 ## Notes
 
 - `/tinfoil.json` returns a directory listing suitable for Tinfoil. `/shop` serves a simple HTML list.
-- This server only lists scraped metadata and does not host installable files.
+- Files are proxied via `/download/:id/:type` and redirected to upstream mirrors.
+- If `AUTH_TOKEN` is missing, `/tinfoil.json` still renders but download links will fail.

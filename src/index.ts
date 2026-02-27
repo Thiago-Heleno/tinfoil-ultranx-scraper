@@ -5,41 +5,21 @@ const BASE_URL = "https://not.ultranx.ru/";
 const API_URL = "https://api.ultranx.ru";
 const LIST_PATH = "en";
 const GAME_PATH_PREFIX = "en/game/";
+const TITLE_ID_RE = /^[0-9A-Fa-f]{16}$/;
+const DOWNLOAD_TYPES = new Set(["base", "update", "dlc", "full"]);
+const SORT_BY = new Set(["release_date", "name", "size"]);
+const SORT_ORDER = new Set(["asc", "desc"]);
 
-// Configuration from environment
-const PORT = parseInt(process.env.PORT ?? "3000", 10);
-const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS ?? "300000", 10);
-const MAX_PAGES = parseInt(process.env.MAX_PAGES ?? "10", 10);
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE ?? "5", 10);
-const MULTI_PAGE_COUNT = parseInt(process.env.MULTI_PAGE_COUNT ?? "3", 10);
-const LOG_REQUESTS = process.env.LOG_REQUESTS !== "false";
-const REFERRER = process.env.REFERRER || "https://not.ultranx.ru";
-const TINFOIL_MIN_VERSION = 17.0;
-
-// Auth token for direct API downloads
-const AUTH_TOKEN =
-  process.env.AUTH_TOKEN ??
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0aWJpcyIsImV4cCI6MjY0MTUwMjI3Nn0.o2LStTlJ4f4MwuTB366KAopvYsSVAX2v_t4NPmqjTFg";
-
-// Request logging
-function log(
-  level: "INFO" | "WARN" | "ERROR",
-  message: string,
-  data?: Record<string, unknown>,
-) {
-  if (!LOG_REQUESTS && level === "INFO") return;
-  const timestamp = new Date().toISOString();
-  const dataStr = data ? ` ${JSON.stringify(data)}` : "";
-  console.log(`[${timestamp}] [${level}] ${message}${dataStr}`);
-}
-
-// Server stats
-const stats = {
-  startTime: Date.now(),
-  requests: 0,
-  errors: 0,
-  cacheHits: 0,
-  cacheMisses: 0,
+const config = {
+  port: intEnv("PORT", 3000, 1, 65535),
+  cacheTtlMs: intEnv("CACHE_TTL_MS", 300_000, 5_000, 3_600_000),
+  maxPages: intEnv("MAX_PAGES", 10, 1, 100),
+  batchSize: intEnv("BATCH_SIZE", 5, 1, 20),
+  fetchTimeoutMs: intEnv("FETCH_TIMEOUT_MS", 15_000, 1_000, 120_000),
+  logRequests: boolEnv("LOG_REQUESTS", true),
+  authToken: (process.env.AUTH_TOKEN ?? "").trim(),
+  referrer: (process.env.REFERRER ?? "https://not.ultranx.ru").trim(),
+  tinfoilVersion: intEnv("TINFOIL_MIN_VERSION", 17, 1, 100),
 };
 
 type TitleCard = {
@@ -50,6 +30,8 @@ type TitleCard = {
   image: string | null;
   url: string;
 };
+
+type GameDownload = { type: string; size: string | null; version: number | null };
 
 type GameDetail = {
   id: string;
@@ -62,242 +44,229 @@ type GameDetail = {
   players: string | null;
   images: string[];
   url: string;
-  downloads: {
-    type: string;
-    apiUrl: string;
-    mirrorUrl: string | null;
-    size: string | null;
-  }[];
+  downloads: GameDownload[];
 };
 
-type CacheEntry = {
-  expiresAt: number;
-  data: string;
-};
+type CacheEntry<T> = { expiresAt: number; value: T };
 
-const cache = new Map<string, CacheEntry>();
+const htmlCache = new Map<string, CacheEntry<string>>();
+const redirectCache = new Map<string, CacheEntry<string>>();
+const stats = { start: Date.now(), requests: 0, errors: 0, cacheHits: 0, cacheMisses: 0 };
 
-function clampInt(
-  value: string | null,
-  min: number,
-  max: number,
-  fallback: number,
-) {
-  const parsed = value ? parseInt(value, 10) : NaN;
-  if (Number.isNaN(parsed)) return fallback;
-  return Math.min(Math.max(parsed, min), max);
+function intEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  const value = raw ? Number.parseInt(raw, 10) : fallback;
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
 }
 
-function parseSizeToBytes(sizeStr: string | null): number {
-  if (!sizeStr) return 0;
-  const match = sizeStr.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return raw.toLowerCase() !== "false";
+}
+
+function log(level: "INFO" | "WARN" | "ERROR", message: string, data?: unknown): void {
+  if (level === "INFO" && !config.logRequests) return;
+  const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
+  console.log(`[${new Date().toISOString()}] [${level}] ${message}${suffix}`);
+}
+
+function clampInt(value: string | null, fallback: number, min: number, max: number): number {
+  const parsed = value ? Number.parseInt(value, 10) : Number.NaN;
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function queryBool(v: string | null): boolean {
+  if (!v) return false;
+  return v === "true" || v === "1" || v.toLowerCase() === "yes";
+}
+
+function sortBy(v: string | null): "release_date" | "name" | "size" {
+  return SORT_BY.has(v ?? "") ? (v as "release_date" | "name" | "size") : "release_date";
+}
+
+function sortOrder(v: string | null): "asc" | "desc" {
+  return SORT_ORDER.has(v ?? "") ? (v as "asc" | "desc") : "desc";
+}
+
+function cleanPath(pathname: string): string {
+  return pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+}
+
+function cacheGet<T>(map: Map<string, CacheEntry<T>>, key: string): T | null {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    map.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, value: T): void {
+  map.set(key, { value, expiresAt: Date.now() + config.cacheTtlMs });
+}
+
+function parseSizeToBytes(size: string | null): number {
+  if (!size) return 0;
+  const match = size.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
   if (!match) return 0;
-  const value = parseFloat(match[1]);
-  const unit = (match[2] || "B").toUpperCase();
-  const multipliers: Record<string, number> = {
-    B: 1,
-    KB: 1024,
-    MB: 1024 * 1024,
-    GB: 1024 * 1024 * 1024,
-  };
-  return Math.round(value * (multipliers[unit] || 1));
+  const value = Number.parseFloat(match[1]);
+  if (!Number.isFinite(value)) return 0;
+  const unit = (match[2] ?? "B").toUpperCase();
+  const mul = unit === "GB" ? 1024 ** 3 : unit === "MB" ? 1024 ** 2 : unit === "KB" ? 1024 : 1;
+  return Math.round(value * mul);
 }
 
-function buildListUrl(params: {
-  page: number;
-  search: string;
-  sortBy: string;
-  sortOrder: string;
-}) {
-  const url = new URL(LIST_PATH, BASE_URL);
-  url.searchParams.set("p", String(params.page));
-  url.searchParams.set("s", params.search);
-  url.searchParams.set("sb", params.sortBy);
-  url.searchParams.set("so", params.sortOrder);
-  return url.toString();
+function parseReleaseDate(date: string | null): number | undefined {
+  if (!date) return undefined;
+  const m = date.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (!m) return undefined;
+  return Number.parseInt(`${m[3]}${m[2]}${m[1]}`, 10);
 }
 
-// Fetch timeout in milliseconds
-const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS ?? "15000", 10);
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
-async function fetchHtml(url: string) {
-  const cached = cache.get(url);
-  const now = Date.now();
-  if (cached && cached.expiresAt > now) {
+function sanitizeFilename(value: string): string {
+  return value.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim();
+}
+
+function json(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
+
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), config.fetchTimeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: c.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchHtml(url: string): Promise<string> {
+  const hit = cacheGet(htmlCache, url);
+  if (hit) {
     stats.cacheHits++;
-    return cached.data;
+    return hit;
   }
   stats.cacheMisses++;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!response.ok) {
-      throw new Error(
-        `Upstream request failed: ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const html = await response.text();
-    cache.set(url, { data: html, expiresAt: now + CACHE_TTL_MS });
-    return html;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(`Request timeout after ${FETCH_TIMEOUT_MS}ms: ${url}`);
-    }
-    throw error;
-  }
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
+  if (!response.ok) throw new Error(`Upstream request failed: ${response.status} ${response.statusText}`);
+  const text = await response.text();
+  cacheSet(htmlCache, url, text);
+  return text;
 }
 
-// Resolve download URL using auth token - follows redirects to get final Yandex.Disk URL
-async function resolveDownloadUrl(
-  titleId: string,
-  type: string = "base",
-): Promise<string | null> {
-  const cacheKey = `download:${titleId}:${type}`;
-  const cached = cache.get(cacheKey);
-  const now = Date.now();
-  if (cached && cached.expiresAt > now) return cached.data;
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
+function extractTitleId(rawHref: string): string {
   try {
-    const apiUrl = `${API_URL}/games/download/${titleId}/${type}`;
-    const response = await fetch(apiUrl, {
-      headers: {
-        Cookie: `auth_token=${AUTH_TOKEN}`,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-      },
-      redirect: "manual",
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeoutId);
-
-    if (response.status === 302 || response.status === 301) {
-      const location = response.headers.get("Location");
-      if (location) {
-        // Cache the resolved URL
-        cache.set(cacheKey, { data: location, expiresAt: now + CACHE_TTL_MS });
-        return location;
-      }
-    }
-    return null;
+    const pathname = new URL(rawHref, BASE_URL).pathname;
+    const id = pathname.split("/").filter(Boolean).at(-1) ?? "";
+    return TITLE_ID_RE.test(id) ? id.toUpperCase() : "";
   } catch {
-    clearTimeout(timeoutId);
-    return null;
+    return "";
   }
 }
 
-function parseListPage(html: string) {
-  const $ = load(html);
+function parseListPage(rawHtml: string): { items: TitleCard[]; pageCount: number | null } {
+  const $ = load(rawHtml);
   const items: TitleCard[] = [];
 
-  $(".card").each((_, card) => {
-    const el = $(card);
-    const href = (el.attr("data-href") ?? "").trim();
-    const title = el.find(".card-title").text().trim();
-    const spans = el.find(".card-info span");
-    const releaseDate = spans.eq(0).text().trim() || null;
-    const size = spans.eq(1).text().trim() || null;
-    const image = el.find("img").attr("src") ?? null;
+  $(".card").each((_, node) => {
+    const card = $(node);
+    const href = (card.attr("data-href") ?? card.find("a").first().attr("href") ?? "").trim();
+    const id = extractTitleId(href);
+    const title = card.find(".card-title").first().text().trim();
+    if (!id || !title) return;
 
-    if (!href || !title) return;
-
-    const url = new URL(href, BASE_URL).toString();
-    const id = href.split("/").pop() ?? "";
-
+    const info = card.find(".card-info span");
+    const imageRaw = card.find("img").first().attr("src") ?? "";
     items.push({
       id,
       title,
-      releaseDate,
-      size,
-      image,
-      url,
+      releaseDate: info.eq(0).text().trim() || null,
+      size: info.eq(1).text().trim() || null,
+      image: imageRaw ? new URL(imageRaw, BASE_URL).toString() : null,
+      url: new URL(href, BASE_URL).toString(),
     });
   });
 
   let pageCount: number | null = null;
-  $(".pagination a").each((_, link) => {
-    const text = $(link).text().trim();
-    const value = parseInt(text, 10);
-    if (!Number.isNaN(value)) {
-      pageCount = Math.max(pageCount ?? 0, value);
-    }
+  $(".pagination a").each((_, node) => {
+    const n = Number.parseInt($(node).text().trim(), 10);
+    if (Number.isFinite(n)) pageCount = Math.max(pageCount ?? 0, n);
   });
 
   return { items, pageCount };
 }
 
-function parseGamePage(html: string, id: string): GameDetail {
-  const $ = load(html);
-  const title = $(".game-hero h1").text().trim() || null;
-
+function parseGamePage(rawHtml: string, id: string): GameDetail {
+  const $ = load(rawHtml);
   const meta: Record<string, string> = {};
-  $(".game-meta p").each((_, row) => {
-    const label = $(row).find("strong").text().trim();
-    const value = $(row).text().replace(label, "").trim();
-    if (label) meta[label.replace(/:$/, "")] = value || "";
+
+  $(".game-meta p").each((_, node) => {
+    const row = $(node);
+    const label = row.find("strong").first().text().replace(/:\s*$/, "").trim();
+    const clone = row.clone();
+    clone.find("strong").remove();
+    if (label) meta[label] = clone.text().trim();
   });
+
+  const downloads: GameDownload[] = [];
+  const seen = new Set<string>();
+  $(".download-buttons a.button").each((_, node) => {
+    const link = $(node);
+    const href = (link.attr("href") ?? "").trim();
+    if (!href) return;
+    const text = link.text().trim();
+    const typed = href.match(/\/download\/[^/]+\/([a-z0-9_-]+)$/i)?.[1]?.toLowerCase();
+    const type = typed ?? (text.toLowerCase().includes("update") ? "update" : text.toLowerCase().includes("dlc") ? "dlc" : text.toLowerCase().includes("full") ? "full" : "base");
+    if (!DOWNLOAD_TYPES.has(type) || seen.has(type)) return;
+    seen.add(type);
+    downloads.push({
+      type,
+      size: text.match(/([\d.]+\s*(?:GB|MB|KB|B))/i)?.[1] ?? null,
+      version: Number.parseInt(text.match(/\bv(\d+)\b/i)?.[1] ?? "", 10) || null,
+    });
+  });
+
+  if (downloads.length === 0) downloads.push({ type: "base", size: null, version: 0 });
 
   const images: string[] = [];
-  $(".carousel-item img").each((_, img) => {
-    const src = $(img).attr("src");
-    if (src) images.push(src);
+  $(".carousel-item img").each((_, node) => {
+    const src = $(node).attr("src");
+    if (src) images.push(new URL(src, BASE_URL).toString());
   });
-
-  // Extract download links
-  const downloads: GameDetail["downloads"] = [];
-  $(".download-buttons > div, .download-buttons > a").each((_, el) => {
-    const container = $(el);
-    const links = container.find("a.button").toArray();
-    if (links.length === 0 && container.is("a.button")) {
-      links.push(el);
-    }
-
-    const apiLink = $(links[0]);
-    const apiUrl = apiLink.attr("href") ?? "";
-    const mirrorLink = links.length > 1 ? $(links[1]) : null;
-    const mirrorUrl = mirrorLink?.attr("href") ?? null;
-
-    // Extract type and size from text
-    const text = apiLink.text().trim();
-    let type = "base";
-    if (text.toLowerCase().includes("update")) type = "update";
-    else if (text.toLowerCase().includes("dlc")) type = "dlc";
-    else if (
-      text.toLowerCase().includes("everything") ||
-      text.toLowerCase().includes("full")
-    )
-      type = "full";
-
-    // Extract size (e.g., "4.79 GB")
-    const sizeMatch = text.match(/([\d.]+\s*(?:GB|MB|KB|B))/i);
-    const size = sizeMatch ? sizeMatch[1] : null;
-
-    if (apiUrl) {
-      downloads.push({ type, apiUrl, mirrorUrl, size });
-    }
-  });
-
-  const url = new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString();
 
   return {
     id,
-    title,
+    title: $(".game-hero h1").first().text().trim() || null,
     publisher: meta["Publisher"] ?? null,
     releaseDate: meta["Release Date"] ?? null,
     size: meta["Size"] ?? null,
@@ -305,796 +274,285 @@ function parseGamePage(html: string, id: string): GameDetail {
     languages: meta["Languages"] ?? null,
     players: meta["Number of Players"] ?? null,
     images,
-    url,
+    url: new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString(),
     downloads,
   };
 }
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+async function getTitlesPage(page: number, search: string, sb: "release_date" | "name" | "size", so: "asc" | "desc"): Promise<{ items: TitleCard[]; pageCount: number | null }> {
+  const u = new URL(LIST_PATH, BASE_URL);
+  u.searchParams.set("p", String(page));
+  if (search) u.searchParams.set("s", search);
+  u.searchParams.set("sb", sb);
+  u.searchParams.set("so", so);
+  const raw = await fetchHtml(u.toString());
+  return parseListPage(raw);
 }
 
-function jsonResponse(payload: unknown, status = 200) {
-  return new Response(JSON.stringify(payload, null, 2), {
-    status,
+async function getTitlesRange(page: number, pages: number, search: string, sb: "release_date" | "name" | "size", so: "asc" | "desc") {
+  const list = await Promise.all(Array.from({ length: pages }, (_, i) => getTitlesPage(page + i, search, sb, so)));
+  const dedupe = new Map<string, TitleCard>();
+  let pageCount: number | null = null;
+  for (const r of list) {
+    if (r.pageCount !== null) pageCount = Math.max(pageCount ?? 0, r.pageCount);
+    for (const item of r.items) dedupe.set(item.id, item);
+  }
+  return { items: [...dedupe.values()], pageCount };
+}
+
+async function getAllTitles(search: string, sb: "release_date" | "name" | "size", so: "asc" | "desc") {
+  const first = await getTitlesPage(1, search, sb, so);
+  const total = first.pageCount ?? 1;
+  const dedupe = new Map<string, TitleCard>(first.items.map((x) => [x.id, x]));
+  for (let start = 2; start <= total; start += config.batchSize) {
+    const end = Math.min(total, start + config.batchSize - 1);
+    const batch = await Promise.all(Array.from({ length: end - start + 1 }, (_, i) => getTitlesPage(start + i, search, sb, so)));
+    for (const r of batch) for (const item of r.items) dedupe.set(item.id, item);
+  }
+  return { items: [...dedupe.values()], pageCount: total };
+}
+
+function publicBaseUrl(request: Request): string {
+  const proto = request.headers.get("x-forwarded-proto");
+  const host = request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+  if (proto && host) return `${proto}://${host}`;
+  return new URL(request.url).origin;
+}
+
+async function resolveDownload(id: string, type: string): Promise<string | null> {
+  const key = `${id}:${type}`;
+  const cached = cacheGet(redirectCache, key);
+  if (cached) return cached;
+  if (!config.authToken) return null;
+
+  const response = await fetchWithTimeout(`${API_URL}/games/download/${id}/${type}`, {
     headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
+      Cookie: `auth_token=${config.authToken}`,
+      Referer: config.referrer,
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     },
-  });
-}
-
-function htmlResponse(html: string, status = 200) {
-  return new Response(html, {
-    status,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
-}
-
-// Fetch a single page of titles
-async function getTitlesPage(params: {
-  page: number;
-  search: string;
-  sortBy: string;
-  sortOrder: string;
-}) {
-  const url = buildListUrl(params);
-  const html = await fetchHtml(url);
-  const parsed = parseListPage(html);
-  return { url, ...parsed };
-}
-
-// Multi-page fetching for faster loading
-async function getTitlesMultiPage(params: {
-  startPage: number;
-  pageCount: number;
-  search: string;
-  sortBy: string;
-  sortOrder: string;
-}) {
-  const allItems: TitleCard[] = [];
-  let totalPageCount: number | null = null;
-
-  // Fetch pages in parallel
-  const pagePromises = [];
-  for (let i = 0; i < params.pageCount; i++) {
-    const page = params.startPage + i;
-    pagePromises.push(
-      getTitlesPage({
-        page,
-        search: params.search,
-        sortBy: params.sortBy,
-        sortOrder: params.sortOrder,
-      }).catch(() => null),
-    );
-  }
-
-  const results = await Promise.all(pagePromises);
-  for (const result of results) {
-    if (result) {
-      allItems.push(...result.items);
-      if (
-        result.pageCount &&
-        (totalPageCount === null || result.pageCount > totalPageCount)
-      ) {
-        totalPageCount = result.pageCount;
-      }
-    }
-  }
-
-  return { items: allItems, pageCount: totalPageCount };
-}
-
-// Load ALL pages at once
-async function getAllTitles(params: {
-  search: string;
-  sortBy: string;
-  sortOrder: string;
-}): Promise<{ items: TitleCard[]; pageCount: number }> {
-  // First, get page 1 to find total page count
-  const firstPage = await getTitlesPage({
-    page: 1,
-    search: params.search,
-    sortBy: params.sortBy,
-    sortOrder: params.sortOrder,
+    redirect: "manual",
   });
 
-  const totalPages = firstPage.pageCount ?? 1;
-  if (totalPages === 1) {
-    return { items: firstPage.items, pageCount: 1 };
+  const location = response.headers.get("location");
+  if ((response.status === 301 || response.status === 302) && location) {
+    cacheSet(redirectCache, key, location);
+    return location;
   }
-
-  // Fetch remaining pages in parallel batches
-  const allItems = [...firstPage.items];
-  const BATCH = 5; // Fetch 5 pages at a time to not overwhelm the server
-
-  for (let startPage = 2; startPage <= totalPages; startPage += BATCH) {
-    const endPage = Math.min(startPage + BATCH - 1, totalPages);
-    const pagePromises = [];
-
-    for (let p = startPage; p <= endPage; p++) {
-      pagePromises.push(
-        getTitlesPage({
-          page: p,
-          search: params.search,
-          sortBy: params.sortBy,
-          sortOrder: params.sortOrder,
-        }).catch(() => null),
-      );
-    }
-
-    const results = await Promise.all(pagePromises);
-    for (const result of results) {
-      if (result) {
-        allItems.push(...result.items);
-      }
-    }
-  }
-
-  return { items: allItems, pageCount: totalPages };
+  return null;
 }
 
-function getLanAddresses() {
-  const interfaces = os.networkInterfaces();
-  const addresses: string[] = [];
-
-  for (const entries of Object.values(interfaces)) {
+function lanIps(): string[] {
+  const ips: string[] = [];
+  for (const entries of Object.values(os.networkInterfaces())) {
     if (!entries) continue;
-    for (const entry of entries) {
-      if (entry.family === "IPv4" && !entry.internal) {
-        addresses.push(entry.address);
-      }
-    }
+    for (const e of entries) if (e.family === "IPv4" && !e.internal) ips.push(e.address);
   }
-
-  return Array.from(new Set(addresses));
+  return [...new Set(ips)];
 }
 
 const server = Bun.serve({
-  port: PORT,
-  async fetch(request) {
-    const startTime = Date.now();
+  port: config.port,
+  async fetch(request: Request): Promise<Response> {
+    const started = Date.now();
     stats.requests++;
 
     const url = new URL(request.url);
-    const pathname =
-      url.pathname.length > 1 && url.pathname.endsWith("/")
-        ? url.pathname.slice(0, -1)
-        : url.pathname;
+    const path = cleanPath(url.pathname);
 
-    log("INFO", `${request.method} ${pathname}`, {
-      query: Object.fromEntries(url.searchParams),
-      ip: request.headers.get("x-forwarded-for") ?? "unknown",
-    });
+    log("INFO", `${request.method} ${path}`, { query: Object.fromEntries(url.searchParams.entries()) });
 
-    if (pathname === "/" || pathname === "/health") {
-      const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
-      return jsonResponse({
-        ok: true,
-        message: "notUltraNX scraper is running",
-        version: "1.0.0",
-        uptime: `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${uptime % 60}s`,
-        stats: {
-          requests: stats.requests,
-          errors: stats.errors,
-          cacheHits: stats.cacheHits,
-          cacheMisses: stats.cacheMisses,
-          cacheSize: cache.size,
-        },
-        endpoints: [
-          "GET /tinfoil.json - Tinfoil shop index",
-          "GET /download/:id/:type - Download proxy (resolves to Yandex)",
-          "GET /api/titles - List all titles",
-          "GET /api/game/:id - Get game details",
-          "GET /shop - HTML browser",
-          "GET /test - Test upstream connectivity",
-        ],
-      });
-    }
+    try {
+      if (request.method !== "GET" && request.method !== "HEAD") return json({ error: "Method not allowed" }, 405);
 
-    // Test upstream connectivity
-    if (pathname === "/test") {
-      const testStart = Date.now();
-      try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-        const response = await fetch("https://not.ultranx.ru/en", {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          },
-          signal: controller.signal,
+      if (path === "/" || path === "/health") {
+        return json({
+          ok: true,
+          uptimeSec: Math.floor((Date.now() - stats.start) / 1000),
+          authConfigured: Boolean(config.authToken),
+          stats: { ...stats, htmlCache: htmlCache.size, redirects: redirectCache.size },
         });
-
-        clearTimeout(timeoutId);
-        const elapsed = Date.now() - testStart;
-
-        return jsonResponse({
-          ok: response.ok,
-          status: response.status,
-          elapsed: `${elapsed}ms`,
-          message: response.ok
-            ? "Upstream reachable"
-            : "Upstream returned error",
-        });
-      } catch (error) {
-        const elapsed = Date.now() - testStart;
-        const isTimeout = error instanceof Error && error.name === "AbortError";
-        return jsonResponse(
-          {
-            ok: false,
-            elapsed: `${elapsed}ms`,
-            error: isTimeout
-              ? "Timeout after 10s"
-              : error instanceof Error
-                ? error.message
-                : String(error),
-          },
-          502,
-        );
       }
-    }
 
-    if (pathname === "/api/titles") {
-      const page = clampInt(url.searchParams.get("p"), 1, 9999, 1);
-      const pages = clampInt(url.searchParams.get("pages"), 1, MAX_PAGES, 1);
-      const search = url.searchParams.get("s") ?? "";
-      const sortBy = url.searchParams.get("sb") ?? "release_date";
-      const sortOrder = url.searchParams.get("so") ?? "desc";
-
-      try {
-        const items: TitleCard[] = [];
-        let pageCount: number | null = null;
-
-        for (let i = 0; i < pages; i += 1) {
-          const currentPage = page + i;
-          const result = await getTitlesPage({
-            page: currentPage,
-            search,
-            sortBy,
-            sortOrder,
-          });
-
-          if (pageCount === null) pageCount = result.pageCount ?? null;
-          items.push(...result.items);
-        }
-
-        return jsonResponse({
-          source: "https://not.ultranx.ru/en",
-          page,
-          pages,
-          pageCount,
-          count: items.length,
-          items,
-        });
-      } catch (error) {
-        return jsonResponse(
-          {
-            error: "Failed to fetch titles",
-            details: error instanceof Error ? error.message : String(error),
-          },
-          502,
-        );
+      if (path === "/test") {
+        const r = await fetchWithTimeout(`${BASE_URL}en`, { headers: { "User-Agent": "Mozilla/5.0" } });
+        return json({ ok: r.ok, status: r.status });
       }
-    }
 
-    if (pathname.startsWith("/api/game/")) {
-      const id = pathname.replace("/api/game/", "").trim();
-      if (!id) return jsonResponse({ error: "Missing game id" }, 400);
-
-      try {
-        const html = await fetchHtml(
-          new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString(),
-        );
-        const details = parseGamePage(html, id);
-        return jsonResponse(details);
-      } catch (error) {
-        return jsonResponse(
-          {
-            error: "Failed to fetch game details",
-            details: error instanceof Error ? error.message : String(error),
-          },
-          502,
-        );
+      if (path === "/api/titles") {
+        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
+        const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
+        const s = (url.searchParams.get("s") ?? "").trim();
+        const sb = sortBy(url.searchParams.get("sb"));
+        const so = sortOrder(url.searchParams.get("so"));
+        const data = await getTitlesRange(p, pages, s, sb, so);
+        return json({ source: `${BASE_URL}${LIST_PATH}`, page: p, pages, pageCount: data.pageCount, count: data.items.length, items: data.items });
       }
-    }
 
-    // Download proxy - resolves API redirect to Yandex URL server-side
-    // This prevents Tinfoil from sending referer to Yandex which blocks it
-    if (pathname.startsWith("/download/")) {
-      const parts = pathname.replace("/download/", "").split("/");
-      const id = parts[0];
-      const type = parts[1] || "base";
-
-      if (!id) return jsonResponse({ error: "Missing game id" }, 400);
-
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-      try {
-        const apiUrl = `${API_URL}/games/download/${id}/${type}`;
-        const response = await fetch(apiUrl, {
-          headers: {
-            Cookie: `auth_token=${AUTH_TOKEN}`,
-            Referer: REFERRER,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          },
-          redirect: "manual",
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeoutId);
-
-        if (response.status === 302 || response.status === 301) {
-          const location = response.headers.get("Location");
-          if (location) {
-            log("INFO", `Resolved download`, {
-              id,
-              type,
-              redirect: location.substring(0, 80) + "...",
-            });
-            return new Response(null, {
-              status: 302,
-              headers: { Location: location },
-            });
-          }
-        }
-
-        log("ERROR", `Download resolution failed`, {
-          id,
-          type,
-          status: response.status,
-        });
-        return jsonResponse({ error: "Download not found" }, 404);
-      } catch (error) {
-        clearTimeout(timeoutId);
-        const errMsg = error instanceof Error ? error.message : String(error);
-        const isTimeout = error instanceof Error && error.name === "AbortError";
-        log("ERROR", `Download proxy error`, {
-          id,
-          type,
-          error: isTimeout ? "Request timeout" : errMsg,
-        });
-        return jsonResponse(
-          {
-            error: isTimeout
-              ? "Download request timed out"
-              : "Failed to resolve download",
-          },
-          isTimeout ? 504 : 502,
-        );
+      if (path.startsWith("/api/game/")) {
+        const id = path.replace("/api/game/", "").trim().toUpperCase();
+        if (!TITLE_ID_RE.test(id)) return json({ error: "Invalid or missing game id" }, 400);
+        const raw = await fetchHtml(new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString());
+        return json(parseGamePage(raw, id));
       }
-    }
 
-    if (pathname === "/shop") {
-      const page = clampInt(url.searchParams.get("p"), 1, 9999, 1);
-      const search = url.searchParams.get("s") ?? "";
-      const sortBy = url.searchParams.get("sb") ?? "release_date";
-      const sortOrder = url.searchParams.get("so") ?? "desc";
+      if (path.startsWith("/download/")) {
+        const [, , rawId, rawType] = path.split("/");
+        const id = (rawId ?? "").toUpperCase();
+        const type = (rawType ?? "base").toLowerCase();
+        if (!TITLE_ID_RE.test(id)) return json({ error: "Invalid or missing game id" }, 400);
+        if (!DOWNLOAD_TYPES.has(type)) return json({ error: "Invalid download type" }, 400);
+        if (!config.authToken) return json({ error: "AUTH_TOKEN is not configured" }, 503);
 
-      try {
-        const result = await getTitlesPage({ page, search, sortBy, sortOrder });
-        const nextPage =
-          result.pageCount && page < result.pageCount ? page + 1 : null;
-        const prevPage = page > 1 ? page - 1 : null;
+        const target = await resolveDownload(id, type);
+        if (!target) return json({ error: "Download not found or unauthorized" }, 404);
+        return new Response(null, { status: 302, headers: { Location: target } });
+      }
 
-        const links = result.items
-          .map((item) => {
-            const title = escapeHtml(item.title);
-            const meta = [item.releaseDate, item.size]
-              .filter(Boolean)
-              .join(" | ");
-            const metaText = meta ? ` - ${escapeHtml(meta)}` : "";
-            return `<li><a href="/shop/game/${item.id}">${title}</a>${metaText}</li>`;
-          })
+      if (path === "/shop") {
+        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
+        const s = (url.searchParams.get("s") ?? "").trim();
+        const sb = sortBy(url.searchParams.get("sb"));
+        const so = sortOrder(url.searchParams.get("so"));
+        const data = await getTitlesRange(p, 1, s, sb, so);
+
+        const prev = p > 1 ? `<a href="/shop?p=${p - 1}">Prev</a>` : "";
+        const next = data.pageCount && p < data.pageCount ? `<a href="/shop?p=${p + 1}">Next</a>` : "";
+        const rows = data.items
+          .map((item) => `<li><a href="/shop/game/${item.id}">${escapeHtml(item.title)}</a>${item.size ? ` - ${escapeHtml(item.size)}` : ""}</li>`)
           .join("\n");
 
-        const navLinks = [
-          prevPage ? `<a href="/shop?p=${prevPage}">Prev</a>` : "",
-          nextPage ? `<a href="/shop?p=${nextPage}">Next</a>` : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
-
-        const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>notUltraNX titles</title>
-</head>
-<body>
-  <h1>notUltraNX titles</h1>
-  <p>Page ${page}${result.pageCount ? ` of ${result.pageCount}` : ""}</p>
-  ${navLinks ? `<p>${navLinks}</p>` : ""}
-  <ul>
-    ${links}
-  </ul>
-</body>
-</html>`;
-
-        return htmlResponse(html);
-      } catch (error) {
-        return htmlResponse(
-          `<!doctype html><html><body><p>Failed to fetch titles: ${escapeHtml(
-            error instanceof Error ? error.message : String(error),
-          )}</p></body></html>`,
-          502,
-        );
+        return html(`<!doctype html><html><body><h1>notUltraNX titles</h1><p>${prev} ${next}</p><ul>${rows}</ul></body></html>`);
       }
-    }
 
-    if (pathname.startsWith("/shop/game/")) {
-      const id = pathname.replace("/shop/game/", "").trim();
-      if (!id) return htmlResponse("<p>Missing game id</p>", 400);
-
-      try {
-        const html = await fetchHtml(
-          new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString(),
-        );
-        const detail = parseGamePage(html, id);
-        const title = detail.title ? escapeHtml(detail.title) : id;
-
-        const metaRows = [
-          ["Publisher", detail.publisher],
-          ["Release Date", detail.releaseDate],
-          ["Size", detail.size],
-          ["Categories", detail.categories],
-          ["Languages", detail.languages],
-          ["Players", detail.players],
-        ]
-          .filter(([, value]) => value)
-          .map(
-            ([label, value]) =>
-              `<li><strong>${label}:</strong> ${escapeHtml(value!)}</li>`,
-          )
-          .join("\n");
-
-        const images = detail.images
-          .map((src) => `<li>${escapeHtml(src)}</li>`)
-          .join("\n");
-
-        const detailHtml = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>${title}</title>
-</head>
-<body>
-  <h1>${title}</h1>
-  <p><a href="/shop">Back to list</a></p>
-  <ul>
-    ${metaRows}
-  </ul>
-  <p>Source: <a href="${escapeHtml(detail.url)}">${escapeHtml(detail.url)}</a></p>
-  ${images ? `<h2>Images</h2><ul>${images}</ul>` : ""}
-</body>
-</html>`;
-
-        return htmlResponse(detailHtml);
-      } catch (error) {
-        return htmlResponse(
-          `<!doctype html><html><body><p>Failed to fetch details: ${escapeHtml(
-            error instanceof Error ? error.message : String(error),
-          )}</p></body></html>`,
-          502,
-        );
+      if (path.startsWith("/shop/game/")) {
+        const id = path.replace("/shop/game/", "").trim().toUpperCase();
+        if (!TITLE_ID_RE.test(id)) return html("<p>Invalid game id</p>", 400);
+        const raw = await fetchHtml(new URL(`${GAME_PATH_PREFIX}${id}`, BASE_URL).toString());
+        const g = parseGamePage(raw, id);
+        const title = escapeHtml(g.title ?? id);
+        return html(`<!doctype html><html><body><h1>${title}</h1><p><a href="/shop">Back</a></p></body></html>`);
       }
-    }
 
-    if (pathname === "/tinfoil.json") {
-      try {
-        const page = clampInt(url.searchParams.get("p"), 1, 9999, 1);
-        const search = url.searchParams.get("s") ?? "";
-        const sortBy = url.searchParams.get("sb") ?? "release_date";
-        const sortOrder = url.searchParams.get("so") ?? "desc";
-        const typeFilter = url.searchParams.get("type") ?? ""; // "games", "dlc", or ""
-        const includeAll = url.searchParams.get("all") === "true"; // Include updates, DLC, full
-        const multiPage = url.searchParams.get("multi") === "true"; // Load multiple pages at once
-        const loadAll = url.searchParams.get("loadall") === "true"; // Load ALL pages at once
+      if (path === "/tinfoil.json") {
+        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
+        const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
+        const s = (url.searchParams.get("s") ?? "").trim();
+        const sb = sortBy(url.searchParams.get("sb"));
+        const so = sortOrder(url.searchParams.get("so"));
+        const loadAll = queryBool(url.searchParams.get("loadall"));
+        const includeAll = queryBool(url.searchParams.get("all"));
+        const filter = (url.searchParams.get("type") ?? "").trim().toLowerCase();
+        const base = publicBaseUrl(request);
 
-        // Get base URL from request for building directory links
-        const host = request.headers.get("host") ?? `localhost:${PORT}`;
-        const protocol = request.headers.get("x-forwarded-proto") ?? "http";
-        const baseUrl = `${protocol}://${host}`;
+        const data = loadAll ? await getAllTitles(s, sb, so) : await getTitlesRange(p, pages, s, sb, so);
+        const isGameFamily = (id: string) => id.endsWith("000") || id.endsWith("800");
+        const filtered = data.items.filter((item) => (filter === "games" ? isGameFamily(item.id) : filter === "dlc" ? !isGameFamily(item.id) : true));
 
-        // Fetch titles based on mode
-        let result: { items: TitleCard[]; pageCount: number | null };
-        if (loadAll) {
-          // Load ALL pages at once
-          log("INFO", "Loading all pages...");
-          result = await getAllTitles({ search, sortBy, sortOrder });
-          log(
-            "INFO",
-            `Loaded ${result.items.length} total items from ${result.pageCount} pages`,
-          );
-        } else if (multiPage) {
-          result = await getTitlesMultiPage({
-            startPage: page,
-            pageCount: MULTI_PAGE_COUNT,
-            search,
-            sortBy,
-            sortOrder,
-          });
-        } else {
-          const singlePage = await getTitlesPage({
-            page,
-            search,
-            sortBy,
-            sortOrder,
-          });
-          result = { items: singlePage.items, pageCount: singlePage.pageCount };
-        }
-        const pageCount = result.pageCount ?? page;
-
-        // Filter by type (base games end in 000/800, DLC ends in 001-7FF)
-        const isBaseGame = (id: string) =>
-          id.endsWith("000") || id.endsWith("800");
-        let filteredItems = result.items;
-        if (typeFilter === "games") {
-          filteredItems = result.items.filter((item) => isBaseGame(item.id));
-        } else if (typeFilter === "dlc") {
-          filteredItems = result.items.filter((item) => !isBaseGame(item.id));
-        }
-        // "all" or "" - no filter, show everything
-
-        // If includeAll, fetch game details to get all download types and metadata
-        type GameDownloads = {
-          item: TitleCard;
-          downloads: { type: string; apiUrl: string; size: string | null }[];
-          publisher?: string | null;
-          description?: string | null;
-          region?: string | null;
-        };
-        let gamesWithDownloads: GameDownloads[] = [];
-
+        const entries = [] as Array<{ item: TitleCard; downloads: GameDownload[]; publisher: string | null; description: string | null; region: string | null }>;
         if (includeAll) {
-          // Fetch game details in parallel (limit concurrency)
-          const fetchGameDownloads = async (
-            item: TitleCard,
-          ): Promise<GameDownloads> => {
-            try {
-              const html = await fetchHtml(
-                new URL(`${GAME_PATH_PREFIX}${item.id}`, BASE_URL).toString(),
-              );
-              const details = parseGamePage(html, item.id);
-              return {
-                item,
-                downloads: details.downloads.map((d) => ({
-                  type: d.type,
-                  apiUrl: d.apiUrl,
-                  size: d.size,
-                })),
-                publisher: details.publisher,
-                description: details.categories, // Use categories as description
-                region: details.languages?.split(",")[0]?.trim() || "WW",
-              };
-            } catch {
-              // Fallback to base only
-              return {
-                item,
-                downloads: [
-                  {
-                    type: "base",
-                    apiUrl: `${API_URL}/games/download/${item.id}/base`,
-                    size: item.size,
-                  },
-                ],
-              };
-            }
-          };
-
-          // Process in batches to avoid overwhelming the server
-          for (let i = 0; i < filteredItems.length; i += BATCH_SIZE) {
-            const batch = filteredItems.slice(i, i + BATCH_SIZE);
-            const results = await Promise.all(batch.map(fetchGameDownloads));
-            gamesWithDownloads.push(...results);
+          for (let i = 0; i < filtered.length; i += config.batchSize) {
+            const batch = filtered.slice(i, i + config.batchSize);
+            const batchData = await Promise.all(
+              batch.map(async (item) => {
+                try {
+                  const raw = await fetchHtml(new URL(`${GAME_PATH_PREFIX}${item.id}`, BASE_URL).toString());
+                  const detail = parseGamePage(raw, item.id);
+                  return { item, downloads: detail.downloads, publisher: detail.publisher, description: detail.categories, region: detail.languages?.split(",")[0]?.trim().toUpperCase() ?? "WW" };
+                } catch {
+                  return { item, downloads: [{ type: "base", size: item.size, version: 0 }], publisher: null, description: null, region: null };
+                }
+              }),
+            );
+            entries.push(...batchData);
           }
         } else {
-          // Just use base downloads from list
-          gamesWithDownloads = filteredItems.map((item) => ({
-            item,
-            downloads: [
-              {
-                type: "base",
-                apiUrl: `${API_URL}/games/download/${item.id}/base`,
-                size: item.size,
-              },
-            ],
-          }));
+          entries.push(...filtered.map((item) => ({ item, downloads: [{ type: "base", size: item.size, version: 0 }], publisher: null, description: null, region: null })));
         }
 
-        // Build titledb for game metadata (including icon for images)
-        const titledb: Record<
-          string,
-          {
-            id: string;
-            name: string;
-            size: number;
-            version?: number;
-            releaseDate?: number;
-            icon?: string;
-            publisher?: string;
-            description?: string;
-            region?: string;
-          }
-        > = {};
-        for (const {
-          item,
-          publisher,
-          description,
-          region,
-        } of gamesWithDownloads) {
-          // Convert date from "DD.MM.YYYY" to YYYYMMDD number
-          let releaseDateNum: number | undefined;
-          if (item.releaseDate) {
-            const parts = item.releaseDate.split(".");
-            if (parts.length === 3) {
-              releaseDateNum = parseInt(
-                `${parts[2]}${parts[1]}${parts[0]}`,
-                10,
-              );
-            }
-          }
-          titledb[item.id] = {
-            id: item.id,
-            name: item.title,
-            size: parseSizeToBytes(item.size),
+        const titledb: Record<string, { id: string; name: string; size: number; version: number; releaseDate?: number; icon?: string; publisher?: string; description?: string; region?: string }> = {};
+        const files: Array<{ url: string; size: number }> = [];
+
+        for (const e of entries) {
+          const release = parseReleaseDate(e.item.releaseDate);
+          titledb[e.item.id] = {
+            id: e.item.id,
+            name: e.item.title,
+            size: parseSizeToBytes(e.item.size),
             version: 0,
-            releaseDate: releaseDateNum,
-            // Add icon from scraped image
-            ...(item.image && { icon: item.image }),
-            // Add extra metadata when available (deep scan mode)
-            ...(publisher && { publisher }),
-            ...(description && { description }),
-            ...(region && { region }),
+            ...(release ? { releaseDate: release } : {}),
+            ...(e.item.image ? { icon: e.item.image } : {}),
+            ...(e.publisher ? { publisher: e.publisher } : {}),
+            ...(e.description ? { description: e.description } : {}),
+            ...(e.region ? { region: e.region } : {}),
           };
-        }
 
-        // Build files array with all download types
-        // Filename format: [Title Name][Title ID][vX].nsz / .dlc.nsz
-        const files: { url: string; size: number }[] = [];
-        for (const { item, downloads } of gamesWithDownloads) {
-          const safeName = item.title.replace(/[<>:"/\\|?*]/g, "_");
-
-          for (const dl of downloads) {
-            let filename: string;
-            const size = parseSizeToBytes(dl.size);
-
-            switch (dl.type) {
-              case "update":
-                // Updates use version number in filename
-                filename = `${safeName} [${item.id}][v65536].nsz`;
-                break;
-              case "dlc":
-                // DLC files
-                filename = `${safeName} [DLC].nsz`;
-                break;
-              case "full":
-                // Full pack (base + update + dlc)
-                filename = `${safeName} [${item.id}][FULL].nsz`;
-                break;
-              default:
-                // Base game
-                filename = `${safeName} [${item.id}][v0].nsz`;
-            }
-
+          for (const d of e.downloads) {
+            if (!DOWNLOAD_TYPES.has(d.type)) continue;
+            const name = sanitizeFilename(e.item.title);
+            const fileName = d.type === "update"
+              ? `${name} [${e.item.id}][v${d.version ?? 0}].nsz`
+              : d.type === "dlc"
+                ? `${name} [${e.item.id}][DLC].nsz`
+                : d.type === "full"
+                  ? `${name} [${e.item.id}][FULL].nsz`
+                  : `${name} [${e.item.id}][v0].nsz`;
             files.push({
-              // Use proxy endpoint to avoid Yandex referer blocking
-              url: `${baseUrl}/download/${item.id}/${dl.type}#${encodeURIComponent(filename)}`,
-              size: size || parseSizeToBytes(item.size),
+              url: `${base}/download/${e.item.id}/${d.type}#${encodeURIComponent(fileName)}`,
+              size: parseSizeToBytes(d.size) || parseSizeToBytes(e.item.size),
             });
           }
         }
 
-        // Build directories for pagination and category navigation
-        const directories: (string | { url: string; title: string })[] = [];
-
-        // Add menu options on first page when not filtered (or when loadall)
-        if ((page === 1 || loadAll) && !typeFilter && !search) {
-          // Main browse options
+        const directories: Array<string | { url: string; title: string }> = [];
+        if (p === 1 && !s && !filter) {
           directories.push(
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true`,
-              title: "[ ALL GAMES ]",
-            },
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true&type=games&all=true`,
-              title: "[ All Games + Updates + DLC ]",
-            },
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true&type=dlc`,
-              title: "[ All DLC Only ]",
-            },
-          );
-
-          // Sort options (with loadall)
-          directories.push(
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true&sb=name&so=asc`,
-              title: "[ A-Z ]",
-            },
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true&sb=name&so=desc`,
-              title: "[ Z-A ]",
-            },
-            {
-              url: `${baseUrl}/tinfoil.json?loadall=true&sb=size&so=desc`,
-              title: "[ By Size ]",
-            },
+            { url: `${base}/tinfoil.json?loadall=true`, title: "[ All Titles ]" },
+            { url: `${base}/tinfoil.json?loadall=true&type=games&all=true`, title: "[ Games + Updates + DLC ]" },
+            { url: `${base}/tinfoil.json?loadall=true&type=dlc`, title: "[ DLC Only ]" },
           );
         }
 
-        // Add pagination (next page) - only when not loading all
-        if (!loadAll && page < pageCount) {
-          const nextParams = new URLSearchParams();
-          const nextPage = multiPage ? page + MULTI_PAGE_COUNT : page + 1;
-          nextParams.set("p", String(nextPage));
-          if (search) nextParams.set("s", search);
-          if (sortBy !== "release_date") nextParams.set("sb", sortBy);
-          if (sortOrder !== "desc") nextParams.set("so", sortOrder);
-          if (typeFilter) nextParams.set("type", typeFilter);
-          if (includeAll) nextParams.set("all", "true");
-          if (multiPage) nextParams.set("multi", "true");
-          directories.push({
-            url: `${baseUrl}/tinfoil.json?${nextParams.toString()}`,
-            title: `[ Page ${nextPage} >> ]`,
-          });
+        if (!loadAll) {
+          const max = data.pageCount ?? p;
+          const next = p + pages;
+          if (next <= max) {
+            const q = new URLSearchParams();
+            q.set("p", String(next));
+            q.set("pages", String(pages));
+            if (s) q.set("s", s);
+            if (sb !== "release_date") q.set("sb", sb);
+            if (so !== "desc") q.set("so", so);
+            if (includeAll) q.set("all", "true");
+            if (filter) q.set("type", filter);
+            directories.push({ url: `${base}/tinfoil.json?${q.toString()}`, title: `[ Page ${next} >> ]` });
+          }
         }
 
-        return jsonResponse({
-          // Tinfoil configuration
-          version: TINFOIL_MIN_VERSION,
-          // No referrer or headers needed - proxy handles auth internally
-
-          // Game data
+        return json({
+          version: config.tinfoilVersion,
           titledb,
           directories,
           files,
+          ...(config.authToken ? {} : { warnings: ["AUTH_TOKEN is missing. /download links will fail."] }),
         });
-      } catch (error) {
-        stats.errors++;
-        log("ERROR", "Failed to build tinfoil index", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return jsonResponse(
-          {
-            error: "Failed to build tinfoil index",
-            details: error instanceof Error ? error.message : String(error),
-            hint: "Check server logs for more details. Make sure the upstream site is accessible.",
-          },
-          502,
-        );
       }
-    }
 
-    return jsonResponse(
-      {
-        error: "Not found",
-        availableEndpoints: [
-          "/tinfoil.json",
-          "/health",
-          "/api/titles",
-          "/api/game/:id",
-        ],
-      },
-      404,
-    );
+      return json({ error: "Not found", endpoints: ["/tinfoil.json", "/health", "/api/titles", "/api/game/:id", "/shop"] }, 404);
+    } catch (error) {
+      stats.errors++;
+      return json({ error: "Internal server error", details: error instanceof Error ? error.message : String(error) }, 500);
+    } finally {
+      log("INFO", `${request.method} ${path} completed`, { ms: Date.now() - started });
+    }
   },
 });
 
-console.log(`Server running on http://localhost:${PORT}`);
-const lanIps = getLanAddresses();
-if (lanIps.length) {
-  console.log(`LAN IPs: ${lanIps.join(", ")}`);
-  console.log(`Tinfoil URL: http://${lanIps[0]}:${server.port}/tinfoil.json`);
+console.log(`Server running on http://localhost:${config.port}`);
+const ips = lanIps();
+if (ips.length > 0) {
+  console.log(`LAN IPs: ${ips.join(", ")}`);
+  console.log(`Tinfoil URL: http://${ips[0]}:${server.port}/tinfoil.json`);
 } else {
   console.log("LAN IPs: not found");
 }
