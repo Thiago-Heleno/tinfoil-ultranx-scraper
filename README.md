@@ -50,7 +50,10 @@ bun run start
 - `BATCH_SIZE` (default: 5)
 - `FETCH_TIMEOUT_MS` (default: 15000)
 - `TINFOIL_MIN_VERSION` (default: 17)
-- `AUTH_TOKEN` (required for `/download/*` and actual installs in Tinfoil)
+- `AUTH_TOKEN` or `ACCESS_TOKEN` (required for `/download/*` and actual installs in Tinfoil; accepts raw JWT, `auth_token=...`, or `Bearer ...`)
+- `DEVICE_ID` (optional; needed only if upstream returns a `DeviceID` auth challenge)
+- `DOWNLOAD_REDIRECT_CACHE_TTL_MS` (default: 0; set >0 to cache resolved download redirects)
+- `DOWNLOAD_PROXY` (default: `false`; use `true` only if direct mirror redirects fail in Tinfoil)
 
 ## Notes
 

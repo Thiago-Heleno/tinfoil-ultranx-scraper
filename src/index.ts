@@ -1,10 +1,15 @@
 import { load } from "cheerio";
+import { createReadStream } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
 import os from "node:os";
+import nodePath from "node:path";
+import { Readable } from "node:stream";
 
 const BASE_URL = "https://not.ultranx.ru/";
 const API_URL = "https://api.ultranx.ru";
 const LIST_PATH = "en";
 const GAME_PATH_PREFIX = "en/game/";
+const LOCAL_GAMES_DIR = nodePath.resolve(process.cwd(), "games");
 const TITLE_ID_RE = /^[0-9A-Fa-f]{16}$/;
 const DOWNLOAD_TYPES = new Set(["base", "update", "dlc", "full"]);
 const SORT_BY = new Set(["release_date", "name", "size"]);
@@ -17,7 +22,10 @@ const config = {
   batchSize: intEnv("BATCH_SIZE", 5, 1, 20),
   fetchTimeoutMs: intEnv("FETCH_TIMEOUT_MS", 15_000, 1_000, 120_000),
   logRequests: boolEnv("LOG_REQUESTS", true),
-  authToken: (process.env.AUTH_TOKEN ?? "").trim(),
+  authToken: normalizeSecretToken(process.env.AUTH_TOKEN ?? process.env.ACCESS_TOKEN ?? process.env.auth_token ?? process.env.access_token ?? ""),
+  deviceId: normalizeSecretToken(process.env.DEVICE_ID ?? process.env.DEVICEID ?? process.env.device_id ?? process.env.deviceid ?? ""),
+  downloadRedirectCacheTtlMs: intEnv("DOWNLOAD_REDIRECT_CACHE_TTL_MS", 0, 0, 600_000),
+  downloadProxy: boolEnv("DOWNLOAD_PROXY", false),
   referrer: (process.env.REFERRER ?? "https://not.ultranx.ru").trim(),
   tinfoilVersion: intEnv("TINFOIL_MIN_VERSION", 17, 1, 100),
 };
@@ -66,6 +74,15 @@ function boolEnv(name: string, fallback: boolean): boolean {
   return raw.toLowerCase() !== "false";
 }
 
+function normalizeSecretToken(value: string): string {
+  return value
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .replace(/^auth_token=/i, "")
+    .replace(/^bearer\s+/i, "")
+    .trim();
+}
+
 function log(level: "INFO" | "WARN" | "ERROR", message: string, data?: unknown): void {
   if (level === "INFO" && !config.logRequests) return;
   const suffix = data === undefined ? "" : ` ${JSON.stringify(data)}`;
@@ -83,8 +100,34 @@ function queryBool(v: string | null): boolean {
   return v === "true" || v === "1" || v.toLowerCase() === "yes";
 }
 
+function queryParam(params: URLSearchParams, aliases: string[]): string | null {
+  for (const key of aliases) {
+    const value = params.get(key);
+    if (value && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function queryPage(params: URLSearchParams): number {
+  const pageRaw = queryParam(params, ["p", "page", "pg", "page_no"]);
+  if (pageRaw) return clampInt(pageRaw, 1, 1, 9_999);
+
+  const offsetRaw = queryParam(params, ["offset", "start"]);
+  if (!offsetRaw) return 1;
+
+  const perPageRaw = queryParam(params, ["limit", "pages", "per_page", "perpage"]);
+  const offset = clampInt(offsetRaw, 0, 0, 9_999_999);
+  const perPage = clampInt(perPageRaw, 1, 1, 1000);
+  return Math.floor(offset / perPage) + 1;
+}
+
+function queryPages(params: URLSearchParams): number {
+  const pagesRaw = queryParam(params, ["pages", "limit", "per_page", "perpage"]);
+  return clampInt(pagesRaw, 1, 1, config.maxPages);
+}
+
 function querySearch(params: URLSearchParams): string {
-  const aliases = ["s", "q", "query", "search", "term"];
+  const aliases = ["s", "q", "query", "search", "term", "filter", "keyword", "text", "name", "title"];
   for (const key of aliases) {
     const value = params.get(key);
     if (value && value.trim()) return value.trim();
@@ -118,6 +161,10 @@ function cacheSet<T>(map: Map<string, CacheEntry<T>>, key: string, value: T): vo
   map.set(key, { value, expiresAt: Date.now() + config.cacheTtlMs });
 }
 
+function cacheSetWithTtl<T>(map: Map<string, CacheEntry<T>>, key: string, value: T, ttlMs: number): void {
+  map.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
 function parseSizeToBytes(size: string | null): number {
   if (!size) return 0;
   const match = size.match(/^([\d.]+)\s*(GB|MB|KB|B)?$/i);
@@ -146,7 +193,14 @@ function escapeHtml(value: string): string {
 }
 
 function sanitizeFilename(value: string): string {
-  return value.replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim();
+  return value.replace(/[<>:"/\\|?*#\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim();
+}
+
+function formatBytes(value: number): string {
+  if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
+  if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(2)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(2)} KB`;
+  return `${value} B`;
 }
 
 function json(payload: unknown, status = 200): Response {
@@ -328,27 +382,259 @@ function publicBaseUrl(request: Request): string {
   return new URL(request.url).origin;
 }
 
-async function resolveDownload(id: string, type: string): Promise<string | null> {
-  const key = `${id}:${type}`;
-  const cached = cacheGet(redirectCache, key);
-  if (cached) return cached;
-  if (!config.authToken) return null;
+type DownloadResolveResult =
+  | { ok: true; url: string; source: string; fromCache?: boolean }
+  | { ok: false; status: number; source: string; challenge?: string | null; details?: string | null };
 
-  const response = await fetchWithTimeout(`${API_URL}/games/download/${id}/${type}`, {
-    headers: {
-      Cookie: `auth_token=${config.authToken}`,
-      Referer: config.referrer,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    },
+function downloadAuthHeaders(): Record<string, string> {
+  const cookieParts: string[] = [];
+  if (config.authToken) cookieParts.push(`auth_token=${config.authToken}`);
+  if (config.deviceId) cookieParts.push(`device_id=${config.deviceId}`);
+
+  const headers: Record<string, string> = {
+    Referer: config.referrer,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    Accept: "*/*",
+  };
+
+  if (cookieParts.length > 0) headers.Cookie = cookieParts.join("; ");
+  if (config.authToken) headers.Authorization = `Bearer ${config.authToken}`;
+  if (config.deviceId) {
+    headers.DeviceID = config.deviceId;
+    headers["X-Device-ID"] = config.deviceId;
+  }
+
+  return headers;
+}
+
+function candidateUrlsFromPayload(payload: unknown, endpoint: string): string[] {
+  if (!payload || typeof payload !== "object") return [];
+
+  const obj = payload as Record<string, unknown>;
+  const nested = obj.data && typeof obj.data === "object" ? (obj.data as Record<string, unknown>) : null;
+  const candidates = [
+    obj.url,
+    obj.location,
+    obj.download,
+    obj.download_url,
+    obj.link,
+    nested?.url,
+    nested?.location,
+    nested?.download,
+    nested?.download_url,
+    nested?.link,
+  ];
+
+  return candidates
+    .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+    .map((raw) => {
+      try {
+        return new URL(raw, endpoint).toString();
+      } catch {
+        return "";
+      }
+    })
+    .filter(Boolean);
+}
+
+async function resolveDownloadEndpoint(endpoint: string): Promise<DownloadResolveResult> {
+  const response = await fetchWithTimeout(endpoint, {
+    headers: downloadAuthHeaders(),
     redirect: "manual",
   });
 
   const location = response.headers.get("location");
-  if ((response.status === 301 || response.status === 302) && location) {
-    cacheSet(redirectCache, key, location);
-    return location;
+  if ([301, 302, 303, 307, 308].includes(response.status) && location) {
+    const absolute = new URL(location, endpoint).toString();
+    return { ok: true, url: absolute, source: endpoint };
+  }
+
+  const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+  if (response.ok && contentType.includes("application/json")) {
+    try {
+      const payload = await response.clone().json();
+      const url = candidateUrlsFromPayload(payload, endpoint)[0];
+      if (url) return { ok: true, url, source: endpoint };
+    } catch {
+      // Ignore JSON parse errors and return detailed upstream info below.
+    }
+  }
+
+  let details: string | null = null;
+  try {
+    const body = (await response.text()).trim();
+    if (body) details = body.slice(0, 500);
+  } catch {
+    // Ignore body read errors and return status-only info.
+  }
+
+  return {
+    ok: false,
+    status: response.status,
+    source: endpoint,
+    challenge: response.headers.get("www-authenticate"),
+    details,
+  };
+}
+
+async function resolveDownload(id: string, type: string): Promise<DownloadResolveResult> {
+  const key = `${id}:${type}`;
+  const cached = cacheGet(redirectCache, key);
+  if (cached) return { ok: true, url: cached, source: "cache", fromCache: true };
+  if (!config.authToken) {
+    return { ok: false, status: 503, source: "local", details: "AUTH_TOKEN is not configured" };
+  }
+
+  const endpoints = [
+    `${API_URL}/games/download/${id}/${type}`,
+    new URL(`download/${id}/${type}`, BASE_URL).toString(),
+  ];
+
+  let lastFailure: DownloadResolveResult | null = null;
+  for (const endpoint of endpoints) {
+    const resolved = await resolveDownloadEndpoint(endpoint);
+    if (resolved.ok) {
+      if (config.downloadRedirectCacheTtlMs > 0) {
+        cacheSetWithTtl(redirectCache, key, resolved.url, config.downloadRedirectCacheTtlMs);
+      }
+      return resolved;
+    }
+    lastFailure = resolved;
+  }
+
+  return lastFailure ?? { ok: false, status: 404, source: "resolver", details: "No download URL returned by upstream" };
+}
+
+function downloadFilenameFromUrl(rawUrl: string): string | null {
+  try {
+    const u = new URL(rawUrl);
+    const fromQuery = u.searchParams.get("filename");
+    if (fromQuery && fromQuery.trim()) return sanitizeFilename(decodeURIComponent(fromQuery).trim());
+  } catch {
+    // Ignore URL parse/decode issues and use upstream header fallback.
   }
   return null;
+}
+
+function copyDownloadHeaders(input: Headers, fallbackFileName: string | null): Headers {
+  const out = new Headers();
+  const passthrough = [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "etag",
+    "last-modified",
+    "cache-control",
+    "content-disposition",
+  ];
+
+  for (const name of passthrough) {
+    const value = input.get(name);
+    if (value) out.set(name, value);
+  }
+
+  if (!out.get("content-type")) out.set("content-type", "application/octet-stream");
+  if (!out.get("cache-control")) out.set("cache-control", "no-store");
+  if (!out.get("content-disposition") && fallbackFileName) {
+    out.set("content-disposition", `attachment; filename="${fallbackFileName}"; filename*=UTF-8''${encodeURIComponent(fallbackFileName)}`);
+  }
+
+  return out;
+}
+
+type LocalGameFile = {
+  relPath: string;
+  absPath: string;
+  size: number;
+  name: string;
+};
+
+async function listLocalGameFiles(): Promise<LocalGameFile[]> {
+  const out: LocalGameFile[] = [];
+  const allowed = new Set([".nsp", ".nsz", ".xci"]);
+
+  async function walk(current: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        const abs = nodePath.join(current, entry.name);
+        if (entry.isDirectory()) {
+          await walk(abs);
+          return;
+        }
+        if (!entry.isFile()) return;
+
+        const ext = nodePath.extname(entry.name).toLowerCase();
+        if (!allowed.has(ext)) return;
+
+        let size = 0;
+        try {
+          size = (await stat(abs)).size;
+        } catch {
+          return;
+        }
+        const rel = nodePath.relative(LOCAL_GAMES_DIR, abs).replaceAll("\\", "/");
+        out.push({ relPath: rel, absPath: abs, size, name: entry.name });
+      }),
+    );
+  }
+
+  await walk(LOCAL_GAMES_DIR);
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+function safeResolveLocalPath(relPathRaw: string): string | null {
+  const decoded = decodeURIComponent(relPathRaw || "").replaceAll("\\", "/");
+  const abs = nodePath.resolve(LOCAL_GAMES_DIR, decoded);
+  const rootWithSep = `${LOCAL_GAMES_DIR}${nodePath.sep}`;
+  if (abs === LOCAL_GAMES_DIR || abs.startsWith(rootWithSep)) return abs;
+  return null;
+}
+
+type ParsedRange = { start: number; end: number } | "invalid";
+
+function fileBody(absPath: string, start?: number, end?: number): ReadableStream {
+  const stream = start === undefined
+    ? createReadStream(absPath)
+    : createReadStream(absPath, { start, end });
+  return Readable.toWeb(stream) as unknown as ReadableStream;
+}
+
+function parseByteRange(rangeHeader: string | null, totalSize: number): ParsedRange | null {
+  if (!rangeHeader) return null;
+  if (totalSize <= 0) return "invalid";
+
+  // Some clients probe files with multi-range requests. We serve the first range.
+  const firstRange = rangeHeader.split(",")[0]?.trim() ?? "";
+  const match = firstRange.match(/^bytes\s*=\s*(\d*)\s*-\s*(\d*)$/i);
+  if (!match) return "invalid";
+
+  const startRaw = match[1] ?? "";
+  const endRaw = match[2] ?? "";
+  if (!startRaw && !endRaw) return "invalid";
+
+  if (startRaw) {
+    const start = Number.parseInt(startRaw, 10);
+    const parsedEnd = endRaw ? Number.parseInt(endRaw, 10) : totalSize - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(parsedEnd)) return "invalid";
+    if (start < 0 || parsedEnd < 0 || start >= totalSize) return "invalid";
+    const end = Math.min(parsedEnd, totalSize - 1);
+    if (end < start) return "invalid";
+    return { start, end };
+  }
+
+  const suffixLength = Number.parseInt(endRaw, 10);
+  if (!Number.isFinite(suffixLength) || suffixLength <= 0) return "invalid";
+  const length = Math.min(suffixLength, totalSize);
+  return { start: totalSize - length, end: totalSize - 1 };
 }
 
 function lanIps(): string[] {
@@ -380,6 +666,16 @@ const server = Bun.serve({
           uptimeSec: Math.floor((Date.now() - stats.start) / 1000),
           authConfigured: Boolean(config.authToken),
           stats: { ...stats, htmlCache: htmlCache.size, redirects: redirectCache.size },
+          endpoints: [
+            "/tinfoil.json",
+            "/tinfoil",
+            "/tinfoil/page/:n",
+            "/tinfoil/mode/:mode",
+            "/local-test.json",
+            "/local-files",
+            "/local-file?path=...",
+            "/health",
+          ],
         });
       }
 
@@ -388,12 +684,107 @@ const server = Bun.serve({
         return json({ ok: r.ok, status: r.status });
       }
 
+      if (path === "/local-test.json") {
+        const base = publicBaseUrl(request);
+        const filesOnDisk = await listLocalGameFiles();
+        const files = filesOnDisk.map((f) => ({
+          url: `${base}/local-file?path=${encodeURIComponent(f.relPath)}#${sanitizeFilename(f.name)}`,
+          size: f.size,
+        }));
+
+        return json({
+          version: config.tinfoilVersion,
+          titledb: {},
+          directories: [],
+          files,
+          source: "local-games-folder",
+          count: files.length,
+          totalSize: filesOnDisk.reduce((sum, f) => sum + f.size, 0),
+        });
+      }
+
+      if (path === "/local-files") {
+        const files = await listLocalGameFiles();
+        return json({
+          count: files.length,
+          files: files.map((f) => ({
+            path: f.relPath,
+            name: f.name,
+            size: f.size,
+            sizeText: formatBytes(f.size),
+            url: `/local-file?path=${encodeURIComponent(f.relPath)}`,
+          })),
+        });
+      }
+
+      if (path === "/local-file") {
+        const relPath = url.searchParams.get("path") ?? "";
+        const abs = safeResolveLocalPath(relPath);
+        if (!abs) return json({ error: "Invalid file path" }, 400);
+
+        const fileStat = await stat(abs).catch(() => null);
+        if (!fileStat || !fileStat.isFile()) return json({ error: "File not found" }, 404);
+
+        const filename = nodePath.basename(abs);
+        const totalSize = fileStat.size || 0;
+        const safeName = sanitizeFilename(filename) || "download.bin";
+        const baseHeaders: Record<string, string> = {
+          "Content-Type": "application/octet-stream",
+          "Content-Disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+          "Accept-Ranges": "bytes",
+          "Cache-Control": "no-store",
+        };
+
+        const range = parseByteRange(request.headers.get("range"), totalSize);
+        if (range === "invalid") {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              ...baseHeaders,
+              "Content-Range": `bytes */${totalSize}`,
+              "Content-Length": "0",
+            },
+          });
+        }
+
+        if (range) {
+          const chunkLength = range.end - range.start + 1;
+          const body = request.method === "HEAD" ? null : fileBody(abs, range.start, range.end);
+          return new Response(body, {
+            status: 206,
+            headers: {
+              ...baseHeaders,
+              "Content-Range": `bytes ${range.start}-${range.end}/${totalSize}`,
+              "Content-Length": String(chunkLength),
+            },
+          });
+        }
+
+        if (request.method === "HEAD") {
+          return new Response(null, {
+            status: 200,
+            headers: {
+              ...baseHeaders,
+              "Content-Length": String(totalSize),
+            },
+          });
+        }
+
+        return new Response(fileBody(abs), {
+          status: 200,
+          headers: {
+            ...baseHeaders,
+            "Content-Length": String(totalSize),
+          },
+        });
+      }
+
       if (path === "/api/titles") {
-        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
-        const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
+        const p = queryPage(url.searchParams);
+        const pages = queryPages(url.searchParams);
         const s = querySearch(url.searchParams);
-        const sb = sortBy(url.searchParams.get("sb"));
-        const so = sortOrder(url.searchParams.get("so"));
+        const sb = sortBy(queryParam(url.searchParams, ["sb", "sort", "sort_by"]));
+        const so = sortOrder(queryParam(url.searchParams, ["so", "order", "sort_order"]));
         const data = await getTitlesRange(p, pages, s, sb, so);
         return json({ source: `${BASE_URL}${LIST_PATH}`, page: p, pages, pageCount: data.pageCount, count: data.items.length, items: data.items });
       }
@@ -411,18 +802,92 @@ const server = Bun.serve({
         const type = (rawType ?? "base").toLowerCase();
         if (!TITLE_ID_RE.test(id)) return json({ error: "Invalid or missing game id" }, 400);
         if (!DOWNLOAD_TYPES.has(type)) return json({ error: "Invalid download type" }, 400);
-        if (!config.authToken) return json({ error: "AUTH_TOKEN is not configured" }, 503);
+        if (!config.authToken) {
+          log("WARN", "Download blocked: AUTH_TOKEN missing", { id, type });
+          return json({ error: "AUTH_TOKEN is not configured", hint: "Set AUTH_TOKEN (or ACCESS_TOKEN) in environment variables." }, 503);
+        }
 
-        const target = await resolveDownload(id, type);
-        if (!target) return json({ error: "Download not found or unauthorized" }, 404);
-        return new Response(null, { status: 302, headers: { Location: target } });
+        const resolved = await resolveDownload(id, type);
+        if (!resolved.ok) {
+          log("WARN", "Download resolve failed", {
+            id,
+            type,
+            status: resolved.status,
+            source: resolved.source,
+            challenge: resolved.challenge ?? undefined,
+          });
+          const isDeviceChallenge = (resolved.challenge ?? "").toLowerCase().includes("deviceid");
+          const hint = isDeviceChallenge && !config.deviceId
+            ? "Upstream requested DeviceID. Set DEVICE_ID from a logged-in browser session."
+            : undefined;
+          return json(
+            {
+              error: "Download not found or unauthorized",
+              upstreamStatus: resolved.status,
+              upstreamSource: resolved.source,
+              ...(resolved.challenge ? { upstreamChallenge: resolved.challenge } : {}),
+              ...(resolved.details ? { upstreamDetails: resolved.details } : {}),
+              ...(hint ? { hint } : {}),
+            },
+            resolved.status === 503 ? 503 : 404,
+          );
+        }
+
+        log("INFO", "Download resolved", {
+          id,
+          type,
+          source: resolved.source,
+          proxy: config.downloadProxy,
+          host: (() => {
+            try {
+              return new URL(resolved.url).host;
+            } catch {
+              return "invalid-url";
+            }
+          })(),
+        });
+
+        if (!config.downloadProxy) {
+          return new Response(null, { status: 302, headers: { Location: resolved.url, "Cache-Control": "no-store" } });
+        }
+
+        const upstreamHeaders: Record<string, string> = {};
+        const range = request.headers.get("range");
+        if (range) upstreamHeaders.Range = range;
+
+        const upstream = await fetchWithTimeout(resolved.url, {
+          method: request.method === "HEAD" ? "HEAD" : "GET",
+          headers: upstreamHeaders,
+          redirect: "follow",
+        });
+
+        if (!upstream.ok && upstream.status !== 206) {
+          log("WARN", "Download proxy failed", { id, type, upstreamStatus: upstream.status });
+          const details = await upstream.text().then((x) => x.trim().slice(0, 500)).catch(() => "");
+          return json(
+            {
+              error: "Mirror download failed",
+              upstreamStatus: upstream.status,
+              ...(details ? { upstreamDetails: details } : {}),
+            },
+            502,
+          );
+        }
+
+        const fileName = downloadFilenameFromUrl(resolved.url);
+        const headers = copyDownloadHeaders(upstream.headers, fileName);
+        log("INFO", "Download proxied", { id, type, upstreamStatus: upstream.status, range: range ?? undefined });
+        return new Response(request.method === "HEAD" ? null : upstream.body, {
+          status: upstream.status,
+          headers,
+        });
       }
 
       if (path === "/shop") {
-        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
+        const p = queryPage(url.searchParams);
         const s = querySearch(url.searchParams);
-        const sb = sortBy(url.searchParams.get("sb"));
-        const so = sortOrder(url.searchParams.get("so"));
+        const sb = sortBy(queryParam(url.searchParams, ["sb", "sort", "sort_by"]));
+        const so = sortOrder(queryParam(url.searchParams, ["so", "order", "sort_order"]));
         const data = await getTitlesRange(p, 1, s, sb, so);
 
         const prev = p > 1 ? `<a href="/shop?p=${p - 1}">Prev</a>` : "";
@@ -443,15 +908,23 @@ const server = Bun.serve({
         return html(`<!doctype html><html><body><h1>${title}</h1><p><a href="/shop">Back</a></p></body></html>`);
       }
 
-      if (path === "/tinfoil.json") {
-        const p = clampInt(url.searchParams.get("p"), 1, 1, 9_999);
-        const pages = clampInt(url.searchParams.get("pages"), 1, 1, config.maxPages);
+      const tinfoilPageMatch = path.match(/^\/tinfoil\/page\/(\d+)$/);
+      const tinfoilModeMatch = path.match(/^\/tinfoil\/mode\/([a-z0-9_-]+)$/);
+      if (path === "/tinfoil.json" || path === "/tinfoil" || tinfoilPageMatch || tinfoilModeMatch) {
+        const isRootIndex = path === "/tinfoil.json" || path === "/tinfoil";
+        const forcedPage = tinfoilPageMatch ? clampInt(tinfoilPageMatch[1] ?? "1", 1, 1, 9_999) : null;
+        const mode = (tinfoilModeMatch?.[1] ?? "").toLowerCase();
+
+        const p = forcedPage ?? queryPage(url.searchParams);
+        const pages = queryPages(url.searchParams);
         const s = querySearch(url.searchParams);
-        const sb = sortBy(url.searchParams.get("sb"));
-        const so = sortOrder(url.searchParams.get("so"));
-        const loadAll = queryBool(url.searchParams.get("loadall"));
-        const includeAll = queryBool(url.searchParams.get("all"));
-        const filter = (url.searchParams.get("type") ?? "").trim().toLowerCase();
+        const sb = sortBy(queryParam(url.searchParams, ["sb", "sort", "sort_by"]));
+        const so = sortOrder(queryParam(url.searchParams, ["so", "order", "sort_order"]));
+        const loadAll = mode === "all" || mode === "games-all" || mode === "dlc" || queryBool(queryParam(url.searchParams, ["loadall", "all_pages", "allpages"]));
+        const includeAll = mode === "games-all" || queryBool(queryParam(url.searchParams, ["all", "full", "details"]));
+        const filterFromMode = mode === "games-all" ? "games" : mode === "dlc" ? "dlc" : "";
+        const filter = (filterFromMode || (queryParam(url.searchParams, ["type", "content_type", "filter_type"]) ?? "")).trim().toLowerCase();
+        const exposeModeDirs = queryBool(queryParam(url.searchParams, ["modes", "advanced"]));
         const base = publicBaseUrl(request);
 
         const data = loadAll ? await getAllTitles(s, sb, so) : await getTitlesRange(p, pages, s, sb, so);
@@ -507,35 +980,37 @@ const server = Bun.serve({
                   ? `${name} [${e.item.id}][FULL].nsz`
                   : `${name} [${e.item.id}][v0].nsz`;
             files.push({
-              url: `${base}/download/${e.item.id}/${d.type}#${encodeURIComponent(fileName)}`,
+              url: `${base}/download/${e.item.id}/${d.type}#${fileName}`,
               size: parseSizeToBytes(d.size) || parseSizeToBytes(e.item.size),
             });
           }
         }
 
-        const directories: Array<string | { url: string; title: string }> = [];
-        if (p === 1 && !s && !filter) {
+        const directories: string[] = [];
+        if (isRootIndex && exposeModeDirs && p === 1 && !s && !filter) {
           directories.push(
-            { url: `${base}/tinfoil.json?loadall=true`, title: "[ All Titles ]" },
-            { url: `${base}/tinfoil.json?loadall=true&type=games&all=true`, title: "[ Games + Updates + DLC ]" },
-            { url: `${base}/tinfoil.json?loadall=true&type=dlc`, title: "[ DLC Only ]" },
+            `${base}/tinfoil/mode/all`,
+            `${base}/tinfoil/mode/games-all`,
+            `${base}/tinfoil/mode/dlc`,
           );
         }
 
         if (!loadAll) {
-          const max = data.pageCount ?? p;
-          const next = p + pages;
-          if (next <= max) {
+          const buildPageUrl = (nextPage: number): string => {
             const q = new URLSearchParams();
-            q.set("p", String(next));
-            q.set("pages", String(pages));
+            if (pages !== 1) q.set("pages", String(pages));
             if (s) q.set("s", s);
             if (sb !== "release_date") q.set("sb", sb);
             if (so !== "desc") q.set("so", so);
             if (includeAll) q.set("all", "true");
             if (filter) q.set("type", filter);
-            directories.push({ url: `${base}/tinfoil.json?${q.toString()}`, title: `[ Page ${next} >> ]` });
-          }
+            const suffix = q.toString();
+            return `${base}/tinfoil/page/${nextPage}${suffix ? `?${suffix}` : ""}`;
+          };
+
+          const max = data.pageCount ?? p;
+          const next = p + pages;
+          if (next <= max) directories.push(buildPageUrl(next));
         }
 
         return json({
@@ -547,7 +1022,7 @@ const server = Bun.serve({
         });
       }
 
-      return json({ error: "Not found", endpoints: ["/tinfoil.json", "/health", "/api/titles", "/api/game/:id", "/shop"] }, 404);
+      return json({ error: "Not found", endpoints: ["/tinfoil.json", "/tinfoil", "/tinfoil/page/:n", "/tinfoil/mode/:mode", "/local-test.json", "/health", "/api/titles", "/api/game/:id", "/shop"] }, 404);
     } catch (error) {
       stats.errors++;
       return json({ error: "Internal server error", details: error instanceof Error ? error.message : String(error) }, 500);
