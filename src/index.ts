@@ -26,6 +26,7 @@ const config = {
   deviceId: normalizeSecretToken(process.env.DEVICE_ID ?? process.env.DEVICEID ?? process.env.device_id ?? process.env.deviceid ?? ""),
   downloadRedirectCacheTtlMs: intEnv("DOWNLOAD_REDIRECT_CACHE_TTL_MS", 0, 0, 600_000),
   downloadProxy: boolEnv("DOWNLOAD_PROXY", false),
+  tinfoilFlatAll: boolEnv("TINFOIL_FLAT_ALL", true),
   referrer: (process.env.REFERRER ?? "https://not.ultranx.ru").trim(),
   tinfoilVersion: intEnv("TINFOIL_MIN_VERSION", 17, 1, 100),
 };
@@ -920,7 +921,9 @@ const server = Bun.serve({
         const s = querySearch(url.searchParams);
         const sb = sortBy(queryParam(url.searchParams, ["sb", "sort", "sort_by"]));
         const so = sortOrder(queryParam(url.searchParams, ["so", "order", "sort_order"]));
-        const loadAll = mode === "all" || mode === "games-all" || mode === "dlc" || queryBool(queryParam(url.searchParams, ["loadall", "all_pages", "allpages"]));
+        const loadAllRequested = mode === "all" || mode === "games-all" || mode === "dlc" || queryBool(queryParam(url.searchParams, ["loadall", "all_pages", "allpages"]));
+        const flatAllRoot = config.tinfoilFlatAll && isRootIndex && !tinfoilPageMatch && !tinfoilModeMatch;
+        const loadAll = loadAllRequested || flatAllRoot;
         const includeAll = mode === "games-all" || queryBool(queryParam(url.searchParams, ["all", "full", "details"]));
         const filterFromMode = mode === "games-all" ? "games" : mode === "dlc" ? "dlc" : "";
         const filter = (filterFromMode || (queryParam(url.searchParams, ["type", "content_type", "filter_type"]) ?? "")).trim().toLowerCase();
@@ -987,7 +990,7 @@ const server = Bun.serve({
         }
 
         const directories: string[] = [];
-        if (isRootIndex && exposeModeDirs && p === 1 && !s && !filter) {
+        if (isRootIndex && !flatAllRoot && exposeModeDirs && p === 1 && !s && !filter) {
           directories.push(
             `${base}/tinfoil/mode/all`,
             `${base}/tinfoil/mode/games-all`,
