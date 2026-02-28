@@ -55,6 +55,7 @@ bun run start
 - `DOWNLOAD_REDIRECT_CACHE_TTL_MS` (default: 0; set >0 to cache resolved download redirects)
 - `DOWNLOAD_PROXY` (default: `false`; use `true` only if direct mirror redirects fail in Tinfoil)
 - `TINFOIL_FLAT_ALL` (default: `true`; makes `/tinfoil.json` return all titles without page directories)
+- `TINFOIL_INCLUDE_ALL` (default: `false`; include base/update/dlc/full variants in index, but slower to build)
 
 ## Notes
 

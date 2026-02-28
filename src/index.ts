@@ -27,6 +27,7 @@ const config = {
   downloadRedirectCacheTtlMs: intEnv("DOWNLOAD_REDIRECT_CACHE_TTL_MS", 0, 0, 600_000),
   downloadProxy: boolEnv("DOWNLOAD_PROXY", false),
   tinfoilFlatAll: boolEnv("TINFOIL_FLAT_ALL", true),
+  tinfoilIncludeAll: boolEnv("TINFOIL_INCLUDE_ALL", false),
   referrer: (process.env.REFERRER ?? "https://not.ultranx.ru").trim(),
   tinfoilVersion: intEnv("TINFOIL_MIN_VERSION", 17, 1, 100),
 };
@@ -60,6 +61,7 @@ type CacheEntry<T> = { expiresAt: number; value: T };
 
 const htmlCache = new Map<string, CacheEntry<string>>();
 const redirectCache = new Map<string, CacheEntry<string>>();
+const tinfoilCache = new Map<string, CacheEntry<unknown>>();
 const stats = { start: Date.now(), requests: 0, errors: 0, cacheHits: 0, cacheMisses: 0 };
 
 function intEnv(name: string, fallback: number, min: number, max: number): number {
@@ -195,6 +197,14 @@ function escapeHtml(value: string): string {
 
 function sanitizeFilename(value: string): string {
   return value.replace(/[<>:"/\\|?*#\u0000-\u001F]/g, "_").replace(/\s+/g, " ").trim();
+}
+
+function titleIdForType(id: string, type: string): string {
+  const normalized = id.trim().toUpperCase();
+  if (type === "update" && TITLE_ID_RE.test(normalized) && normalized.endsWith("000")) {
+    return `${normalized.slice(0, 13)}800`;
+  }
+  return normalized;
 }
 
 function formatBytes(value: number): string {
@@ -666,7 +676,7 @@ const server = Bun.serve({
           ok: true,
           uptimeSec: Math.floor((Date.now() - stats.start) / 1000),
           authConfigured: Boolean(config.authToken),
-          stats: { ...stats, htmlCache: htmlCache.size, redirects: redirectCache.size },
+          stats: { ...stats, htmlCache: htmlCache.size, redirects: redirectCache.size, tinfoilCache: tinfoilCache.size },
           endpoints: [
             "/tinfoil.json",
             "/tinfoil",
@@ -924,11 +934,14 @@ const server = Bun.serve({
         const loadAllRequested = mode === "all" || mode === "games-all" || mode === "dlc" || queryBool(queryParam(url.searchParams, ["loadall", "all_pages", "allpages"]));
         const flatAllRoot = config.tinfoilFlatAll && isRootIndex && !tinfoilPageMatch && !tinfoilModeMatch;
         const loadAll = loadAllRequested || flatAllRoot;
-        const includeAll = mode === "games-all" || queryBool(queryParam(url.searchParams, ["all", "full", "details"]));
+        const includeAllRequested = mode === "games-all" || queryBool(queryParam(url.searchParams, ["all", "full", "details"]));
+        const includeAll = includeAllRequested || (flatAllRoot && config.tinfoilIncludeAll);
         const filterFromMode = mode === "games-all" ? "games" : mode === "dlc" ? "dlc" : "";
         const filter = (filterFromMode || (queryParam(url.searchParams, ["type", "content_type", "filter_type"]) ?? "")).trim().toLowerCase();
-        const exposeModeDirs = queryBool(queryParam(url.searchParams, ["modes", "advanced"]));
         const base = publicBaseUrl(request);
+        const tinfoilCacheKey = `${base}|${path}|${url.search}`;
+        const tinfoilCached = cacheGet(tinfoilCache, tinfoilCacheKey);
+        if (tinfoilCached) return json(tinfoilCached);
 
         const data = loadAll ? await getAllTitles(s, sb, so) : await getTitlesRange(p, pages, s, sb, so);
         const isGameFamily = (id: string) => id.endsWith("000") || id.endsWith("800");
@@ -974,14 +987,15 @@ const server = Bun.serve({
 
           for (const d of e.downloads) {
             if (!DOWNLOAD_TYPES.has(d.type)) continue;
+            const nameTitleId = titleIdForType(e.item.id, d.type);
             const name = sanitizeFilename(e.item.title);
             const fileName = d.type === "update"
-              ? `${name} [${e.item.id}][v${d.version ?? 0}].nsz`
+              ? `${name} [${nameTitleId}][v${d.version ?? 0}].nsz`
               : d.type === "dlc"
-                ? `${name} [${e.item.id}][DLC].nsz`
+                ? `${name} [${nameTitleId}][DLC].nsz`
                 : d.type === "full"
-                  ? `${name} [${e.item.id}][FULL].nsz`
-                  : `${name} [${e.item.id}][v0].nsz`;
+                  ? `${name} [${nameTitleId}][FULL].nsz`
+                  : `${name} [${nameTitleId}][v0].nsz`;
             files.push({
               url: `${base}/download/${e.item.id}/${d.type}#${fileName}`,
               size: parseSizeToBytes(d.size) || parseSizeToBytes(e.item.size),
@@ -990,39 +1004,16 @@ const server = Bun.serve({
         }
 
         const directories: string[] = [];
-        if (isRootIndex && !flatAllRoot && exposeModeDirs && p === 1 && !s && !filter) {
-          directories.push(
-            `${base}/tinfoil/mode/all`,
-            `${base}/tinfoil/mode/games-all`,
-            `${base}/tinfoil/mode/dlc`,
-          );
-        }
-
-        if (!loadAll) {
-          const buildPageUrl = (nextPage: number): string => {
-            const q = new URLSearchParams();
-            if (pages !== 1) q.set("pages", String(pages));
-            if (s) q.set("s", s);
-            if (sb !== "release_date") q.set("sb", sb);
-            if (so !== "desc") q.set("so", so);
-            if (includeAll) q.set("all", "true");
-            if (filter) q.set("type", filter);
-            const suffix = q.toString();
-            return `${base}/tinfoil/page/${nextPage}${suffix ? `?${suffix}` : ""}`;
-          };
-
-          const max = data.pageCount ?? p;
-          const next = p + pages;
-          if (next <= max) directories.push(buildPageUrl(next));
-        }
-
-        return json({
+        const payload = {
           version: config.tinfoilVersion,
+          success: "Connected to tinfoil-ultranx-scraper",
           titledb,
           directories,
           files,
           ...(config.authToken ? {} : { warnings: ["AUTH_TOKEN is missing. /download links will fail."] }),
-        });
+        };
+        cacheSet(tinfoilCache, tinfoilCacheKey, payload);
+        return json(payload);
       }
 
       return json({ error: "Not found", endpoints: ["/tinfoil.json", "/tinfoil", "/tinfoil/page/:n", "/tinfoil/mode/:mode", "/local-test.json", "/health", "/api/titles", "/api/game/:id", "/shop"] }, 404);
